@@ -1349,8 +1349,7 @@ impl Agent {
 
     /// Load multiple extensions in parallel, persisting state once at the end.
     ///
-    /// Unlike `add_extension`, this avoids per-extension persistence and acquires
-    /// the container lock once upfront to prevent serialisation of the parallel futures.
+    /// Unlike `add_extension`, this avoids per-extension persistence.
     ///
     /// State is persisted once every extension has settled, even when all of them
     /// fail: the session's enabled list records what actually loaded, so failed

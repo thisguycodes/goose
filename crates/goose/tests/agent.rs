@@ -2850,7 +2850,7 @@ mod tests {
             }
         }
 
-        async fn setup_agent_and_session(
+        pub(super) async fn setup_agent_and_session(
             test_name: &str,
         ) -> (Arc<Agent>, Arc<SessionManager>, String, TempDir) {
             let temp_dir = TempDir::new().unwrap();
@@ -3036,6 +3036,69 @@ mod tests {
             assert_eq!(
                 persisted_extension_names(&session_manager, &session_id).await,
                 vec!["pending".to_string()]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    mod load_extensions_from_session_tests {
+        use super::add_extensions_bulk_tests::setup_agent_and_session;
+        use goose::agents::extension::Envs;
+        use goose::agents::ExtensionConfig;
+        use std::time::{Duration, Instant};
+
+        /// A stdio "server" that never answers `initialize` and exits after
+        /// `lifetime`, so each start costs a known wall-clock time.
+        fn slow_stdio_extension(name: &str, lifetime: Duration) -> ExtensionConfig {
+            ExtensionConfig::Stdio {
+                name: name.to_string(),
+                description: format!("Slow test extension {name}"),
+                cmd: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!("sleep {}", lifetime.as_secs_f64()),
+                ],
+                envs: Envs::default(),
+                env_keys: vec![],
+                timeout: Some(30),
+                cwd: None,
+                bundled: None,
+                available_tools: vec![],
+            }
+        }
+
+        #[tokio::test]
+        async fn test_session_extensions_start_concurrently() {
+            const SERVER_LIFETIME: Duration = Duration::from_millis(500);
+            const SERVER_COUNT: u32 = 5;
+
+            let (agent, session_manager, session_id, _temp_dir) =
+                setup_agent_and_session("session-load-concurrent").await;
+            let extensions = (0..SERVER_COUNT)
+                .map(|i| slow_stdio_extension(&format!("slow{i}"), SERVER_LIFETIME))
+                .collect();
+            agent
+                .persist_extension_configs(&session_id, extensions)
+                .await
+                .unwrap();
+            let session = session_manager
+                .get_session(&session_id, false)
+                .await
+                .unwrap();
+
+            let started = Instant::now();
+            let results = agent.load_extensions_from_session(&session).await;
+            let elapsed = started.elapsed();
+
+            assert_eq!(results.len(), SERVER_COUNT as usize);
+            assert!(results.iter().all(|result| !result.success), "{results:?}");
+            assert!(
+                elapsed >= SERVER_LIFETIME,
+                "starts did not wait for the server to exit: {elapsed:?}"
+            );
+            assert!(
+                elapsed < SERVER_LIFETIME * SERVER_COUNT,
+                "{SERVER_COUNT} starts of {SERVER_LIFETIME:?} took {elapsed:?}, no faster than running them serially"
             );
         }
     }
