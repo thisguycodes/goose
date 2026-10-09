@@ -18,11 +18,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or_else(|| format!("unknown protocol version {version}"))?,
                 None => ProtocolVersion::V_2026_07_28,
             };
-            McpFixtureServer::with_max_protocol_version(max_version)
-                .serve(stdio())
-                .await?
-                .waiting()
-                .await?;
+            let server = McpFixtureServer::with_max_protocol_version(max_version);
+            let server = match (
+                std::env::var("MCP_FIXTURE_HANDSHAKE_ARRIVED"),
+                std::env::var("MCP_FIXTURE_HANDSHAKE_WAIT_FOR"),
+            ) {
+                (Ok(arrived), Ok(wait_for)) => {
+                    server.with_handshake_rendezvous(arrived.into(), wait_for.into())
+                }
+                _ => server,
+            };
+            server.serve(stdio()).await?.waiting().await?;
         }
         (Some("http") | None, None) => {
             let service = StreamableHttpService::new(

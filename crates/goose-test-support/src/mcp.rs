@@ -1,15 +1,18 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Annotations, CallToolResult, ContentBlock, ElicitRequestParams, ElicitationAction,
-    ElicitationSchema, Implementation, InitializeResult, MetaObject, PrimitiveSchemaDefinition,
-    ProgressNotificationParam, ProgressToken, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, RequestMetaObject, ResourceContents, Role,
-    ServerCapabilities, ServerConfig, StringSchema, TextContent,
+    Annotations, CallToolResult, ContentBlock, DiscoverResult, ElicitRequestParams,
+    ElicitationAction, ElicitationSchema, Implementation, InitializeRequestParams,
+    InitializeResult, MetaObject, PrimitiveSchemaDefinition, ProgressNotificationParam,
+    ProgressToken, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, RequestMetaObject, ResourceContents, Role, ServerCapabilities,
+    ServerConfig, StringSchema, TextContent,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::{
@@ -57,11 +60,18 @@ pub struct ElicitArgs {
 }
 
 #[derive(Clone)]
+struct HandshakeRendezvous {
+    arrived: PathBuf,
+    wait_for: PathBuf,
+}
+
+#[derive(Clone)]
 pub struct McpFixtureServer {
     instance_id: String,
     max_protocol_version: ProtocolVersion,
     /// Set by `change_tools`; `late_tool` is only published afterwards.
     tools_changed: Arc<AtomicBool>,
+    handshake_rendezvous: Option<HandshakeRendezvous>,
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
@@ -86,6 +96,7 @@ impl McpFixtureServer {
             ),
             max_protocol_version,
             tools_changed: Arc::new(AtomicBool::new(false)),
+            handshake_rendezvous: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -257,10 +268,54 @@ impl McpFixtureServer {
     }
 }
 
+impl McpFixtureServer {
+    /// Announce this server's handshake by creating `arrived`, then answer it
+    /// only once the server that creates `wait_for` has announced its own.
+    /// Two servers pointed at each other can both start only if they are
+    /// started concurrently.
+    pub fn with_handshake_rendezvous(mut self, arrived: PathBuf, wait_for: PathBuf) -> Self {
+        self.handshake_rendezvous = Some(HandshakeRendezvous { arrived, wait_for });
+        self
+    }
+
+    async fn rendezvous(&self) -> Result<(), McpError> {
+        let Some(rendezvous) = &self.handshake_rendezvous else {
+            return Ok(());
+        };
+        std::fs::File::create(&rendezvous.arrived)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        while !rendezvous.wait_for.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpFixtureServer {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(ProtocolVersion::known_up_to(&self.max_protocol_version))
+    }
+
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, McpError> {
+        self.rendezvous().await?;
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        ))
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        self.rendezvous().await?;
+        context.peer.set_peer_info(request.clone());
+        self.negotiate_initialize(&request)
     }
 
     async fn list_tools(

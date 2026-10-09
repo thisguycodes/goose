@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{env, fs};
 
@@ -167,6 +167,23 @@ fn stdio_fixture(name: &str, mode: Option<&str>, available_tools: &[&str]) -> Ex
         bundled: Some(false),
         available_tools: available_tools.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+fn rendezvous_stdio_fixture(name: &str, arrived: &Path, wait_for: &Path) -> ExtensionConfig {
+    let mut config = stdio_fixture(name, None, &[]);
+    if let ExtensionConfig::Stdio { envs, .. } = &mut config {
+        *envs = Envs::new(HashMap::from([
+            (
+                "MCP_FIXTURE_HANDSHAKE_ARRIVED".to_string(),
+                arrived.display().to_string(),
+            ),
+            (
+                "MCP_FIXTURE_HANDSHAKE_WAIT_FOR".to_string(),
+                wait_for.display().to_string(),
+            ),
+        ]));
+    }
+    config
 }
 
 fn http_fixture(name: &str, uri: &str) -> ExtensionConfig {
@@ -752,6 +769,35 @@ async fn extension_protocol_traffic_through_a_lease() {
     .await
     .unwrap();
     assert_eq!(text_of(&first_result.await.unwrap().unwrap()), "Linus");
+}
+
+/// Each server answers its handshake only once the other's has arrived, so
+/// both can start only if the lease has both in flight at once.
+#[tokio::test]
+async fn a_lease_starts_its_stdio_extensions_concurrently() {
+    // Pinning the client to one handshake leaves the hang guard as the only
+    // timer; the Auto lifecycle would retry with `initialize` after 10s.
+    let fx = fixture(false, Some(ProtocolVersion::V_2026_07_28)).await;
+    let session = fx.session(SessionType::Hidden).await;
+    let first_arrived = session.working_dir.join("first-arrived");
+    let second_arrived = session.working_dir.join("second-arrived");
+    let lease = fx
+        .resolve(
+            &session,
+            &[
+                rendezvous_stdio_fixture("first", &first_arrived, &second_arrived),
+                rendezvous_stdio_fixture("second", &second_arrived, &first_arrived),
+            ],
+        )
+        .await;
+
+    // A hang guard, not a timing assertion: serial starts never finish.
+    let results = tokio::time::timeout(std::time::Duration::from_secs(60), lease.start())
+        .await
+        .expect("the lease started its extensions one at a time");
+
+    assert!(results.iter().all(|result| result.success), "{results:?}");
+    assert!(first_arrived.exists() && second_arrived.exists());
 }
 
 enum TestMode {
