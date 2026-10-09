@@ -1,15 +1,18 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Annotations, CallToolResult, ContentBlock, ElicitRequestParams, ElicitationAction,
-    ElicitationSchema, Implementation, InitializeResult, MetaObject, PrimitiveSchemaDefinition,
-    ProgressNotificationParam, ProgressToken, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, RequestMetaObject, ResourceContents, Role,
-    ServerCapabilities, ServerConfig, StringSchema, TextContent,
+    Annotations, CallToolResult, ContentBlock, DiscoverResult, ElicitRequestParams,
+    ElicitationAction, ElicitationSchema, Implementation, InitializeRequestParams,
+    InitializeResult, MetaObject, PrimitiveSchemaDefinition, ProgressNotificationParam,
+    ProgressToken, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, RequestMetaObject, ResourceContents, Role, ServerCapabilities,
+    ServerConfig, StringSchema, TextContent,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::{
@@ -28,6 +31,15 @@ pub const APP_CARD_RESOURCE_URI: &str = "ui://fixture/card";
 pub const APP_CARD_HTML: &str = "<html><body>card</body></html>";
 
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Set both on the stdio fixture binary to make it rendezvous at the
+/// handshake; see [`McpFixtureServer::with_handshake_rendezvous`].
+pub const HANDSHAKE_ARRIVED_ENV: &str = "MCP_FIXTURE_HANDSHAKE_ARRIVED";
+pub const HANDSHAKE_WAIT_FOR_ENV: &str = "MCP_FIXTURE_HANDSHAKE_WAIT_FOR";
+
+/// Bounds how long a server waits at a handshake rendezvous, so one whose
+/// peer never shows up fails its handshake instead of waiting forever.
+const RENDEZVOUS_DEADLINE: Duration = Duration::from_secs(300);
 
 const SESSION_ID_META_KEY: &str = "agent-session-id";
 const WORKING_DIR_META_KEY: &str = "agent-working-dir";
@@ -53,11 +65,18 @@ pub struct ElicitArgs {
 }
 
 #[derive(Clone)]
+struct HandshakeRendezvous {
+    arrived: PathBuf,
+    wait_for: PathBuf,
+}
+
+#[derive(Clone)]
 pub struct McpFixtureServer {
     instance_id: String,
     max_protocol_version: ProtocolVersion,
     /// Set by `change_tools`; `late_tool` is only published afterwards.
     tools_changed: Arc<AtomicBool>,
+    handshake_rendezvous: Option<HandshakeRendezvous>,
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
@@ -82,6 +101,7 @@ impl McpFixtureServer {
             ),
             max_protocol_version,
             tools_changed: Arc::new(AtomicBool::new(false)),
+            handshake_rendezvous: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -251,10 +271,64 @@ impl McpFixtureServer {
     }
 }
 
+impl McpFixtureServer {
+    /// Announce this server's handshake by creating `arrived`, then answer it
+    /// only once the server that creates `wait_for` has announced its own.
+    /// Two servers pointed at each other can both start only if they are
+    /// started concurrently.
+    pub fn with_handshake_rendezvous(mut self, arrived: PathBuf, wait_for: PathBuf) -> Self {
+        self.handshake_rendezvous = Some(HandshakeRendezvous { arrived, wait_for });
+        self
+    }
+
+    async fn rendezvous(&self) -> Result<(), McpError> {
+        let Some(rendezvous) = &self.handshake_rendezvous else {
+            return Ok(());
+        };
+        std::fs::File::create(&rendezvous.arrived)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let deadline = Instant::now() + RENDEZVOUS_DEADLINE;
+        while !rendezvous.wait_for.exists() {
+            if Instant::now() >= deadline {
+                let message = format!(
+                    "no handshake arrived at {} within {RENDEZVOUS_DEADLINE:?}",
+                    rendezvous.wait_for.display()
+                );
+                // The client reports a failed start with the process's stderr.
+                eprintln!("{message}");
+                return Err(McpError::internal_error(message, None));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpFixtureServer {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(ProtocolVersion::known_up_to(&self.max_protocol_version))
+    }
+
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, McpError> {
+        self.rendezvous().await?;
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        ))
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        self.rendezvous().await?;
+        context.peer.set_peer_info(request.clone());
+        self.negotiate_initialize(&request)
     }
 
     async fn list_tools(

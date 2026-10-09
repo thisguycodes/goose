@@ -1,4 +1,4 @@
-use goose_test_support::mcp::McpFixtureServer;
+use goose_test_support::mcp::{McpFixtureServer, HANDSHAKE_ARRIVED_ENV, HANDSHAKE_WAIT_FOR_ENV};
 use rmcp::model::ProtocolVersion;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -18,11 +18,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or_else(|| format!("unknown protocol version {version}"))?,
                 None => ProtocolVersion::V_2026_07_28,
             };
-            McpFixtureServer::with_max_protocol_version(max_version)
-                .serve(stdio())
-                .await?
-                .waiting()
-                .await?;
+            let server = McpFixtureServer::with_max_protocol_version(max_version);
+            let server = match (
+                std::env::var(HANDSHAKE_ARRIVED_ENV),
+                std::env::var(HANDSHAKE_WAIT_FOR_ENV),
+            ) {
+                (Ok(arrived), Ok(wait_for)) => {
+                    server.with_handshake_rendezvous(arrived.into(), wait_for.into())
+                }
+                (Err(_), Err(_)) => server,
+                _ => {
+                    return Err(format!(
+                        "set both {HANDSHAKE_ARRIVED_ENV} and {HANDSHAKE_WAIT_FOR_ENV} or neither"
+                    )
+                    .into())
+                }
+            };
+            server.serve(stdio()).await?.waiting().await?;
         }
         (Some("http") | None, None) => {
             let service = StreamableHttpService::new(

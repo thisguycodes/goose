@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{env, fs};
 
@@ -22,7 +22,10 @@ use goose::agents::GoosePlatform;
 use goose::config::GooseMode;
 use goose::conversation::message::ActionRequiredData;
 use goose::session::SessionType;
-use goose_test_support::mcp::{ContextReport, APP_CARD_HTML, APP_CARD_RESOURCE_URI};
+use goose_test_support::mcp::{
+    ContextReport, APP_CARD_HTML, APP_CARD_RESOURCE_URI, HANDSHAKE_ARRIVED_ENV,
+    HANDSHAKE_WAIT_FOR_ENV,
+};
 use goose_test_support::{McpFixture, FAKE_CODE};
 
 use test_case::test_case;
@@ -153,6 +156,15 @@ impl Fixture {
 }
 
 fn stdio_fixture(name: &str, mode: Option<&str>, available_tools: &[&str]) -> ExtensionConfig {
+    stdio_fixture_with_envs(name, mode, available_tools, Envs::default())
+}
+
+fn stdio_fixture_with_envs(
+    name: &str,
+    mode: Option<&str>,
+    available_tools: &[&str],
+    envs: Envs,
+) -> ExtensionConfig {
     let mut args = vec!["stdio".to_string()];
     args.extend(mode.map(str::to_string));
     ExtensionConfig::Stdio {
@@ -160,13 +172,27 @@ fn stdio_fixture(name: &str, mode: Option<&str>, available_tools: &[&str]) -> Ex
         description: "stdio fixture".to_string(),
         cmd: FIXTURE_BINARY_PATH.to_string_lossy().to_string(),
         args,
-        envs: Envs::default(),
+        envs,
         env_keys: vec![],
         timeout: Some(30),
         cwd: None,
         bundled: Some(false),
         available_tools: available_tools.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+fn rendezvous_stdio_fixture(name: &str, arrived: &Path, wait_for: &Path) -> ExtensionConfig {
+    let envs = Envs::new(HashMap::from([
+        (
+            HANDSHAKE_ARRIVED_ENV.to_string(),
+            arrived.to_string_lossy().into_owned(),
+        ),
+        (
+            HANDSHAKE_WAIT_FOR_ENV.to_string(),
+            wait_for.to_string_lossy().into_owned(),
+        ),
+    ]));
+    stdio_fixture_with_envs(name, None, &[], envs)
 }
 
 fn http_fixture(name: &str, uri: &str) -> ExtensionConfig {
@@ -752,6 +778,51 @@ async fn extension_protocol_traffic_through_a_lease() {
     .await
     .unwrap();
     assert_eq!(text_of(&first_result.await.unwrap().unwrap()), "Linus");
+}
+
+/// Each server answers its handshake only once the other's has arrived, so
+/// both can start only if the lease has both in flight at once.
+#[tokio::test]
+async fn a_lease_starts_its_stdio_extensions_concurrently() {
+    // Pinning the client to one handshake leaves the hang guard as the only
+    // timer; the Auto lifecycle would retry with `initialize` after 10s.
+    let fx = fixture(false, Some(ProtocolVersion::V_2026_07_28)).await;
+    let session = fx.session(SessionType::Hidden).await;
+    // A provider that runs its own tool loop would drop the stdio selection
+    // from the lease, whatever the developer's own config says.
+    fx.session_manager
+        .update(&session.id)
+        .provider_name("openai")
+        .apply()
+        .await
+        .unwrap();
+    let first_arrived = session.working_dir.join("first-arrived");
+    let second_arrived = session.working_dir.join("second-arrived");
+    fx.session_manager
+        .update_enabled_extensions(&session.id, |selected| {
+            *selected = vec![
+                rendezvous_stdio_fixture("first", &first_arrived, &second_arrived),
+                rendezvous_stdio_fixture("second", &second_arrived, &first_arrived),
+            ]
+        })
+        .await
+        .unwrap();
+
+    // A hang guard, not a timing assertion: serial starts never finish.
+    let results = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        fx.manager
+            .current_lease(&session.id)
+            .await
+            .unwrap()
+            .start()
+            .await
+    })
+    .await
+    .expect("the lease started its extensions one at a time");
+
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results.iter().all(|result| result.success), "{results:?}");
+    assert!(first_arrived.exists() && second_arrived.exists());
 }
 
 enum TestMode {
