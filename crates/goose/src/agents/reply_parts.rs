@@ -197,10 +197,13 @@ pub(crate) fn prepare_inference_tools(
                 | pctx_code_mode::config::ToolDisclosure::Filesystem => {
                     // in catalog & filesystem styles, progressive search is handled
                     // by pctx, so we want to omit all non-first-class extensions
-                    // from the standard tool list
-                    if crate::agents::extension_manager::get_tool_owner(&tool).is_some_and(
-                        |owner| crate::agents::extension_manager::is_first_class_extension(&owner),
-                    ) || crate::agents::extension_manager::get_tool_resource_uri(&tool).is_some()
+                    // from the standard tool list. Tools with no owning extension
+                    // (e.g. `recipe__final_output`) are not pctx callbacks, so hiding
+                    // them would leave the model no way to call them.
+                    if crate::agents::extension_manager::get_tool_owner(&tool).is_none_or(|owner| {
+                        crate::agents::extension_manager::is_first_class_extension(&owner)
+                    }) || crate::agents::extension_manager::get_tool_resource_uri(&tool)
+                        .is_some()
                     {
                         Some(tool)
                     } else {
@@ -1084,6 +1087,39 @@ mod tests {
             tool = tool.with_meta(rmcp::model::MetaObject(obj));
         }
         tool
+    }
+
+    #[cfg(feature = "code-mode")]
+    #[test]
+    fn code_mode_keeps_tools_without_an_owning_extension() {
+        use crate::agents::extension_manager::TOOL_EXTENSION_META_KEY;
+
+        let owned = |name: &str, owner: &str| {
+            Tool::new(name.to_string(), "a tool", object!({ "type": "object" })).with_meta(
+                rmcp::model::MetaObject(
+                    serde_json::json!({ TOOL_EXTENSION_META_KEY: owner })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+        };
+        let tools = vec![
+            Tool::new(
+                "recipe__final_output",
+                "final output",
+                object!({ "type": "object" }),
+            ),
+            owned("calculator__add", "calculator"),
+            owned("shell", "developer"),
+        ];
+
+        let names: Vec<_> = prepare_inference_tools(tools, true)
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+
+        assert_eq!(names, ["recipe__final_output", "shell"]);
     }
 
     #[test]

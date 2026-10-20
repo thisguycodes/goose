@@ -1,23 +1,22 @@
 use anyhow::Result;
 use serde_json::json;
 
+#[cfg(feature = "code-mode")]
+use super::calculator_extension::ADD;
 use super::dummy_api::{DummyApi, ProviderFeatures};
 use super::pipeline::{
-    test_pipeline, test_pipeline_with, test_pipeline_with_scheduler, MessageKind::Agent,
-    MessageKind::Error, MessageKind::ToolResponse,
+    test_pipeline, test_pipeline_with, test_pipeline_with_scheduler, unadvertised_tool_request,
+    MessageKind::Agent, MessageKind::Error, MessageKind::ToolResponse,
 };
 use crate::agents::extension::ExtensionConfig;
 use crate::agents::final_output_tool::{FINAL_OUTPUT_CONTINUATION_MESSAGE, FINAL_OUTPUT_TOOL_NAME};
 use crate::agents::platform_extensions::scheduler::MANAGE_SCHEDULE_TOOL_NAME_COMPLETE;
-#[cfg(feature = "code-mode")]
 use crate::agents::state_machine::ops_tool_approval::TOOL_EXECUTABLE_KEY;
 use crate::agents::tool_execution::CHAT_MODE_TOOL_SKIPPED_RESPONSE;
 use crate::agents::types::{RetryConfig, SuccessCheck};
-#[cfg(feature = "code-mode")]
 use crate::config::permission::PermissionLevel;
 use crate::config::GooseMode;
-#[cfg(feature = "code-mode")]
-use crate::conversation::message::MessageContent;
+use crate::conversation::message::{Message, MessageContent};
 use crate::recipe::build_recipe::build_recipe_from_template;
 use crate::recipe::{Recipe, Response, SubRecipe};
 
@@ -376,7 +375,6 @@ async fn empty_responses_hand_the_turn_to_recipe_operations() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "code-mode")]
 #[tokio::test]
 async fn unadvertised_final_output_is_neither_approved_nor_executed() -> Result<()> {
     let (pipeline, api) = test_pipeline().await?;
@@ -394,19 +392,22 @@ async fn unadvertised_final_output_is_neither_approved_nor_executed() -> Result<
         .build()
         .expect("valid recipe");
     pipeline.set_recipe(recipe).await?;
-    pipeline.add_extension("code_execution").await?;
     pipeline.set_permission(FINAL_OUTPUT_TOOL_NAME, PermissionLevel::AlwaysAllow);
     let pipeline = pipeline
         .with_max_turns(2)
         .with_goose_mode(GooseMode::Approve)
         .await;
-    api.on("try the hidden final output")
-        .unadvertised_call(FINAL_OUTPUT_TOOL_NAME, json!({ "result": "escaped" }));
+    pipeline
+        .seed([
+            Message::user().with_text("try the hidden final output"),
+            unadvertised_tool_request(FINAL_OUTPUT_TOOL_NAME, json!({ "result": "escaped" })),
+        ])
+        .await?;
     api.on("not available").reply("recipe call blocked");
 
-    let result = pipeline.run(["try the hidden final output"]).await?;
+    let result = pipeline.resume().await?;
 
-    assert!(!api.calls()[0].advertises_tool(FINAL_OUTPUT_TOOL_NAME));
+    assert_eq!(api.call_count(), 1);
     assert!(result.conversation().messages().iter().any(|message| {
         message.content.iter().any(|content| {
             matches!(content, MessageContent::ToolResponse(response)
@@ -448,6 +449,93 @@ async fn unadvertised_final_output_is_neither_approved_nor_executed() -> Result<
         .as_ref()
         .and_then(|metadata| metadata.get(TOOL_EXECUTABLE_KEY))
         .is_none());
+
+    Ok(())
+}
+
+#[cfg(feature = "code-mode")]
+#[tokio::test]
+async fn final_output_stays_callable_under_code_mode() -> Result<()> {
+    let (pipeline, api) = test_pipeline().await?;
+    let recipe = Recipe::builder()
+        .title("Structured output")
+        .description("Return structured output")
+        .instructions("Compute the answer")
+        .response(Response {
+            json_schema: Some(json!({
+                "type": "object",
+                "properties": { "result": { "type": "string" } },
+                "required": ["result"]
+            })),
+        })
+        .build()
+        .expect("valid recipe");
+    pipeline.set_recipe(recipe).await?;
+    pipeline.add_extension("code_execution").await?;
+    api.on("compute the answer")
+        .call(FINAL_OUTPUT_TOOL_NAME, json!({ "result": "42" }));
+
+    let result = pipeline.run(["compute the answer"]).await?;
+
+    assert_eq!(api.call_count(), 1);
+    let call = &api.calls()[0];
+    assert!(call.advertises_tool("execute_typescript"));
+    assert!(!call.advertises_tool(ADD));
+    assert!(call.advertises_tool(FINAL_OUTPUT_TOOL_NAME));
+    result.assert_message(-1, Agent, r#"{"result":"42"}"#);
+
+    Ok(())
+}
+
+#[cfg(feature = "code-mode")]
+#[tokio::test]
+async fn delegated_subagent_completes_under_code_mode() -> Result<()> {
+    let (pipeline, api) = test_pipeline().await?;
+    let host = api.uri();
+    let _guard = env_lock::lock_env([
+        ("OPENAI_API_KEY", Some("fake-openai-no-keyring")),
+        ("OPENAI_HOST", Some(host.as_str())),
+        ("OPENAI_BASE_PATH", Some("chat/completions")),
+        ("OPENAI_CUSTOM_HEADERS", Some("")),
+    ]);
+    let recipe = Recipe::builder()
+        .title("Delegating recipe")
+        .description("Delegates research")
+        .prompt("Delegate the research")
+        .extensions(vec![ExtensionConfig::Platform {
+            name: "summon".to_string(),
+            description: "Delegate work".to_string(),
+            display_name: None,
+            bundled: None,
+            available_tools: vec![],
+        }])
+        .build()
+        .expect("valid recipe");
+    pipeline.set_recipe(recipe).await?;
+    pipeline.add_extension("code_execution").await?;
+    api.on("Delegate the research").call(
+        "delegate",
+        json!({ "instructions": "Find the answer", "max_turns": 1 }),
+    );
+    api.on("Find the answer")
+        .call(FINAL_OUTPUT_TOOL_NAME, json!({ "summary": "found it" }));
+    api.on(r#"completed: {"summary":"found it"}"#)
+        .reply("research delivered");
+
+    let result = pipeline.run(["Delegate the research"]).await?;
+
+    assert_eq!(api.call_count(), 3);
+    let subagent_call = &api.calls()[1];
+    assert!(subagent_call.advertises_tool("execute_typescript"));
+    assert!(subagent_call.advertises_tool(FINAL_OUTPUT_TOOL_NAME));
+    assert!(result.conversation().messages().iter().any(|message| {
+        message.is_agent_visible()
+            && !message.is_user_visible()
+            && message
+                .as_concat_text()
+                .ends_with(r#"completed: {"summary":"found it"}"#)
+    }));
+    result.assert_message(-1, Agent, "research delivered");
 
     Ok(())
 }

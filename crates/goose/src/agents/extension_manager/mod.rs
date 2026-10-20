@@ -422,7 +422,7 @@ pub fn get_parameter_names(tool: &Tool) -> Vec<String> {
     names
 }
 
-const TOOL_EXTENSION_META_KEY: &str = "goose_extension";
+pub(crate) const TOOL_EXTENSION_META_KEY: &str = "goose_extension";
 
 pub fn get_tool_owner(tool: &Tool) -> Option<String> {
     tool.meta

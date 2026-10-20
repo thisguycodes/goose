@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Result;
-use rmcp::model::ElicitationAction;
+use rmcp::model::{CallToolRequestParams, ElicitationAction};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -14,6 +14,7 @@ use crate::agents::extension_manager::{
     ExtensionLease, ExtensionManager, ExtensionManagerCapabilities,
 };
 use crate::agents::mcp_client::McpClientTrait;
+use crate::agents::state_machine::ops_llm::{ADVERTISED_TOOLS_NOTE, LLM_OPERATION_NAME};
 use crate::agents::state_machine::{
     BangShellOperation, CompactionOperation, DoctorOperation, Emitter, ExitOnErrorOperation,
     ForegroundSubagentOperation, GooseEffect, GooseInferenceProvider,
@@ -27,7 +28,9 @@ use crate::agents::subagent_handler::ForegroundSubagentRunner;
 use crate::agents::AgentEvent;
 use crate::config::permission::{PermissionLevel, PermissionManager};
 use crate::config::GooseMode;
-use crate::conversation::message::{ActionRequiredData, Message, MessageContent};
+use crate::conversation::message::{
+    ActionRequiredData, InferenceMetadata, Message, MessageContent,
+};
 use crate::conversation::Conversation;
 use crate::hooks::HookManager;
 use crate::permission::permission_inspector::PermissionInspector;
@@ -1124,6 +1127,29 @@ impl TestRun {
             "message {index} does not contain {contains:?}: {content:?}"
         );
     }
+}
+
+/// An assistant message that calls `name` although the inference it came from
+/// advertised no tools: the shape of a hallucinated tool call.
+pub(super) fn unadvertised_tool_request(name: &str, arguments: serde_json::Value) -> Message {
+    let arguments = arguments.as_object().cloned().unwrap_or_default();
+    let mut message = Message::assistant()
+        .with_tool_request(
+            format!("unadvertised-{name}"),
+            Ok(CallToolRequestParams::new(name.to_string()).with_arguments(arguments)),
+        )
+        .with_inference(InferenceMetadata {
+            provider: "openai".to_string(),
+            requested_model: goose_providers::openai::OPEN_AI_DEFAULT_MODEL.to_string(),
+            resolved_model: None,
+            provider_session_id: None,
+        });
+    message.metadata.set_operation_note(
+        LLM_OPERATION_NAME,
+        ADVERTISED_TOOLS_NOTE,
+        serde_json::Value::Array(Vec::new()),
+    );
+    message
 }
 
 pub(super) async fn run_machine(pipeline: &TestPipeline) -> Result<Vec<AgentEvent>> {
