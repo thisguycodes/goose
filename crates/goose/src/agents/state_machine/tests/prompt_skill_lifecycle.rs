@@ -3,13 +3,16 @@ use serde_json::json;
 
 use super::calculator_extension::ADD;
 use super::pipeline::{
-    test_pipeline, unadvertised_tool_request, MessageKind::Agent, MessageKind::ToolResponse,
-    MessageKind::User,
+    test_pipeline, MessageKind::Agent, MessageKind::ToolResponse, MessageKind::User,
 };
+#[cfg(feature = "code-mode")]
 use crate::agents::state_machine::ops_tool_approval::TOOL_EXECUTABLE_KEY;
+#[cfg(feature = "code-mode")]
 use crate::config::permission::PermissionLevel;
+#[cfg(feature = "code-mode")]
 use crate::config::GooseMode;
-use crate::conversation::message::{Message, MessageContent};
+#[cfg(feature = "code-mode")]
+use crate::conversation::message::MessageContent;
 
 #[tokio::test]
 async fn prompt_and_skill_lifecycle() -> Result<()> {
@@ -95,34 +98,28 @@ async fn prompt_and_skill_lifecycle() -> Result<()> {
     Ok(())
 }
 
-fn write_private_skill(pipeline: &super::pipeline::TestPipeline) -> Result<()> {
+#[cfg(feature = "code-mode")]
+#[tokio::test]
+async fn unadvertised_load_skill_is_neither_approved_nor_loaded() -> Result<()> {
+    let (pipeline, api) = test_pipeline().await?;
     let skill_dir = pipeline.working_dir().join(".agents/skills/private");
     std::fs::create_dir_all(&skill_dir)?;
     std::fs::write(
         skill_dir.join("SKILL.md"),
         "---\nname: private\ndescription: Private test skill\n---\nPRIVATE_SKILL_CONTENT",
     )?;
-    Ok(())
-}
 
-#[tokio::test]
-async fn unadvertised_load_skill_is_neither_approved_nor_loaded() -> Result<()> {
-    let (pipeline, api) = test_pipeline().await?;
-    write_private_skill(&pipeline)?;
+    pipeline.add_extension("code_execution").await?;
     pipeline.set_permission("load_skill", PermissionLevel::AlwaysAllow);
     let pipeline = pipeline.with_goose_mode(GooseMode::Approve).await;
-    pipeline
-        .seed([
-            Message::user().with_text("try the hidden skill"),
-            unadvertised_tool_request("load_skill", json!({ "name": "private" })),
-        ])
-        .await?;
+    api.on("try the hidden skill")
+        .unadvertised_call("load_skill", json!({ "name": "private" }));
     api.on("not available").reply("skill call blocked");
 
-    let result = pipeline.resume().await?;
+    let result = pipeline.run(["try the hidden skill"]).await?;
 
-    assert_eq!(api.call_count(), 1);
-    assert!(!api.calls()[0].input_contains("PRIVATE_SKILL_CONTENT"));
+    assert!(!api.calls()[0].advertises_tool("load_skill"));
+    assert!(!api.calls()[1].input_contains("PRIVATE_SKILL_CONTENT"));
     result.assert_message(-2, ToolResponse, "Tool 'load_skill' is not available");
     result.assert_message(-1, Agent, "skill call blocked");
     assert!(!result.conversation().messages().iter().any(|message| {
@@ -149,28 +146,6 @@ async fn unadvertised_load_skill_is_neither_approved_nor_loaded() -> Result<()> 
         .as_ref()
         .and_then(|metadata| metadata.get(TOOL_EXECUTABLE_KEY))
         .is_none());
-
-    Ok(())
-}
-
-#[cfg(feature = "code-mode")]
-#[tokio::test]
-async fn load_skill_stays_callable_under_code_mode() -> Result<()> {
-    let (pipeline, api) = test_pipeline().await?;
-    write_private_skill(&pipeline)?;
-    pipeline.add_extension("code_execution").await?;
-    api.on("use the private skill")
-        .call("load_skill", json!({ "name": "private" }));
-    api.on("PRIVATE_SKILL_CONTENT").reply("skill loaded");
-
-    let result = pipeline.run(["use the private skill"]).await?;
-
-    assert_eq!(api.call_count(), 2);
-    assert!(api.calls()[0].advertises_tool("load_skill"));
-    assert!(api.calls()[0].advertises_tool("execute_typescript"));
-    assert!(!api.calls()[0].advertises_tool(ADD));
-    result.assert_message(-2, ToolResponse, "PRIVATE_SKILL_CONTENT");
-    result.assert_message(-1, Agent, "skill loaded");
 
     Ok(())
 }

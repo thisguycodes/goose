@@ -197,13 +197,13 @@ pub(crate) fn prepare_inference_tools(
                 | pctx_code_mode::config::ToolDisclosure::Filesystem => {
                     // in catalog & filesystem styles, progressive search is handled
                     // by pctx, so we want to omit all non-first-class extensions
-                    // from the standard tool list. Tools with no owning extension
-                    // (e.g. `recipe__final_output`) are not pctx callbacks, so hiding
-                    // them would leave the model no way to call them.
-                    if crate::agents::extension_manager::get_tool_owner(&tool).is_none_or(|owner| {
-                        crate::agents::extension_manager::is_first_class_extension(&owner)
-                    }) || crate::agents::extension_manager::get_tool_resource_uri(&tool)
-                        .is_some()
+                    // from the standard tool list. `recipe__final_output` is executed
+                    // by the recipe operation and has no pctx callback, so it stays.
+                    if crate::agents::extension_manager::get_tool_owner(&tool).is_some_and(
+                        |owner| crate::agents::extension_manager::is_first_class_extension(&owner),
+                    ) || crate::agents::extension_manager::get_tool_resource_uri(&tool).is_some()
+                        || tool.name.as_ref()
+                            == crate::agents::final_output_tool::FINAL_OUTPUT_TOOL_NAME
                     {
                         Some(tool)
                     } else {
@@ -1091,8 +1091,9 @@ mod tests {
 
     #[cfg(feature = "code-mode")]
     #[test]
-    fn code_mode_keeps_tools_without_an_owning_extension() {
+    fn code_mode_keeps_final_output_but_not_other_ownerless_tools() {
         use crate::agents::extension_manager::TOOL_EXTENSION_META_KEY;
+        use crate::agents::final_output_tool::FINAL_OUTPUT_TOOL_NAME;
 
         let owned = |name: &str, owner: &str| {
             Tool::new(name.to_string(), "a tool", object!({ "type": "object" })).with_meta(
@@ -1106,10 +1107,11 @@ mod tests {
         };
         let tools = vec![
             Tool::new(
-                "recipe__final_output",
+                FINAL_OUTPUT_TOOL_NAME,
                 "final output",
                 object!({ "type": "object" }),
             ),
+            Tool::new("load_skill", "load a skill", object!({ "type": "object" })),
             owned("calculator__add", "calculator"),
             owned("shell", "developer"),
         ];
@@ -1119,7 +1121,7 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
 
-        assert_eq!(names, ["recipe__final_output", "shell"]);
+        assert_eq!(names, [FINAL_OUTPUT_TOOL_NAME, "shell"]);
     }
 
     #[test]
