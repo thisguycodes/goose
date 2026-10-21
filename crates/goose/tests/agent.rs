@@ -1741,6 +1741,7 @@ mod tests {
                     &GoalState {
                         goal: Some("Ensure the sky is blue".to_string()),
                         grind: None,
+                        pursue: None,
                     },
                 )
                 .await?;
