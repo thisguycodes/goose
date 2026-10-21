@@ -2,7 +2,6 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use goose_agent::max_turns::MaxTurnsOperation;
 use goose_agent::post_tool_call_hook::PostToolCallHook;
 use goose_providers::api_client::{ApiClient, AuthMethod};
 use goose_providers::decision::DecisionProvider;
@@ -17,10 +16,11 @@ use crate::agents::state_machine::{
     DoctorOperation, EmptyResponseOperation, ExitOnErrorOperation, FinalOutputOperation,
     GooseEffect, GooseInferenceProvider, GooseInferenceRequestPreparer, GoosePostToolHook,
     GoosePreToolHook, GooseStopHook, GooseToolApproval, InferenceRunner, Operation,
-    PreToolCallHookOperation, ProjectOperation, RecipeOperation, RemainingToolCallsOperation,
-    RetryOperation, SkillOperation, SlashCommandOperation, StateMachine, StatusOperation,
-    SteerOperation, SteerQueue, Step, StopHookOperation, SubagentOperation, ToolApprovalOperation,
-    ToolExecutionOperation, ToolPairCompactionOperation, UnhandledToolCallsOperation,
+    PreToolCallHookOperation, ProjectOperation, PursueMaxTurnsOperation, PursueOperation,
+    RecipeOperation, RemainingToolCallsOperation, RetryOperation, SkillOperation,
+    SlashCommandOperation, StateMachine, StatusOperation, SteerOperation, SteerQueue, Step,
+    StopHookOperation, SubagentOperation, ToolApprovalOperation, ToolExecutionOperation,
+    ToolPairCompactionOperation, UnhandledToolCallsOperation,
 };
 use crate::agents::subagent_handler::ForegroundSubagentRunner;
 use crate::agents::tool_execution::DECLINED_RESPONSE;
@@ -139,6 +139,7 @@ pub(crate) fn build_state_machine(
             Arc::clone(&post_tool_call_hook),
         )),
         Arc::new(RecipeOperation::new(Arc::clone(&extension_manager))),
+        Arc::new(PursueOperation::new(provider.clone())),
         Arc::new(ToolExecutionOperation::new(
             Arc::clone(&extension_manager),
             hook_manager.clone(),
@@ -194,7 +195,7 @@ pub(crate) fn build_state_machine(
                 .with_deny_limit_message(move || deny_limit_warning(stop_hook_block_cap)),
         ),
         Arc::new(ExitOnErrorOperation),
-        Arc::new(MaxTurnsOperation::new(max_turns)),
+        Arc::new(PursueMaxTurnsOperation::new(max_turns)),
         Arc::new(StatusOperation::new(provider.clone(), model_config.clone())),
     ];
     operations.extend(remaining_operations);
