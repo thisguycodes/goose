@@ -68,7 +68,7 @@ pub(super) fn final_output_called_with_other_tools(
         && has_sibling_tool_calls(messages, &request.id)
 }
 
-fn has_sibling_tool_calls(messages: &[Message], request_id: &str) -> bool {
+pub(crate) fn has_sibling_tool_calls(messages: &[Message], request_id: &str) -> bool {
     let Some(message_index) = messages.iter().position(|message| {
         message
             .content

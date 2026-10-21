@@ -17,6 +17,7 @@ mod ops_exit_on_error;
 mod ops_llm;
 mod ops_maxturns;
 mod ops_project;
+mod ops_pursue;
 pub(crate) mod ops_recipe;
 mod ops_remaining_tool_calls;
 mod ops_retry;
@@ -73,6 +74,7 @@ pub(super) use ops_exit_on_error::ExitOnErrorOperation;
 pub(super) use ops_llm::{enrich_unclaimed_tool_errors, GooseInferenceProvider, InferenceRunner};
 pub(super) use ops_maxturns::{MaxTurnsOperation, MAX_TURNS_MESSAGE};
 pub(super) use ops_project::ProjectOperation;
+pub(super) use ops_pursue::PursueOperation;
 pub(super) use ops_recipe::RecipeOperation;
 pub(super) use ops_remaining_tool_calls::RemainingToolCallsOperation;
 #[cfg(test)]
