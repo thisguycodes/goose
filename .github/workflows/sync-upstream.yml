@@ -20,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: write # create/update the sync branch ref
-      pull-requests: write # open the sync PR and merge it
+      contents: write # push the sync branch and merge the PR
+      pull-requests: write # open the sync PR
     steps:
       - name: Sync main from upstream
         env:
@@ -44,13 +44,13 @@ jobs:
             exit 0
           fi
 
-          # Forks share the object network with upstream, so pointing the
-          # bot-managed branch at the upstream SHA is a single API call.
-          if gh api "repos/$REPO/git/refs/heads/$BRANCH" --jq .ref >/dev/null 2>&1; then
-            gh api -X PATCH "repos/$REPO/git/refs/heads/$BRANCH" -f sha="$UPSTREAM_SHA" -F force=true --jq .ref
-          else
-            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$UPSTREAM_SHA" --jq .ref
-          fi
+          # A plain git push works with GITHUB_TOKEN; the git/refs REST
+          # endpoint returns 403 "Resource not accessible by integration".
+          git init -q sync-repo
+          git -C sync-repo remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git -C sync-repo fetch -q "https://github.com/${UPSTREAM}.git" main
+          # sync/upstream is managed exclusively by this workflow, so force is safe.
+          git -C sync-repo push -f origin FETCH_HEAD:refs/heads/"$BRANCH"
 
           if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
             gh pr create \
