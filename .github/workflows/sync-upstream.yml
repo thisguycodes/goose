@@ -1,0 +1,62 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Hourly, off the top of the hour.
+    - cron: "47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Only run in the fork; scheduled runs happen on the default branch.
+    if: github.repository == 'thisguycodes/goose'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # push the rebased main
+    steps:
+      - name: Check out main # zizmor: ignore[artipacked] credentials are needed to push the rebased main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # Optional fine-grained PAT (Contents: RW on this fork). Pushes made
+          # with GITHUB_TOKEN do not trigger CI on main; with SYNC_TOKEN they do.
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # main is upstream/main plus the fork's commits, rebased hourly. A linear
+      # history means each conflict is resolved exactly once; merge commits
+      # re-present the same conflicts every sync.
+      - name: Rebase main onto upstream/main
+        env:
+          UPSTREAM_URL: https://github.com/aaif-goose/goose.git
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main
+          # Commits upstream has since merged become empty and are dropped.
+          if ! git rebase --empty=drop upstream/main; then
+            git rebase --abort
+            echo "::error::Sync conflicts. Fix locally: git fetch upstream && git rebase --empty=drop upstream/main && git push --force-with-lease origin main"
+            exit 1
+          fi
+
+      - name: Push rebased main
+        run: |
+          set -euo pipefail
+          if git diff --quiet HEAD origin/main; then
+            echo "Already up to date."
+          else
+            # Lease against the just-fetched origin/main: an unexpected push
+            # fails the sync instead of being clobbered.
+            git push --force-with-lease=main:origin/main origin HEAD:main
+            git log --oneline origin/main..HEAD >> "$GITHUB_STEP_SUMMARY" || true
+          fi
