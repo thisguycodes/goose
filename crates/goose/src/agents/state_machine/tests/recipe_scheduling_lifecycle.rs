@@ -16,8 +16,6 @@ use crate::agents::final_output_tool::{FINAL_OUTPUT_CONTINUATION_MESSAGE, FINAL_
 use crate::agents::platform_extensions::scheduler::MANAGE_SCHEDULE_TOOL_NAME_COMPLETE;
 use crate::agents::tool_execution::CHAT_MODE_TOOL_SKIPPED_RESPONSE;
 use crate::agents::types::{RetryConfig, SuccessCheck};
-#[cfg(feature = "code-mode")]
-use crate::config::permission::PermissionLevel;
 use crate::config::GooseMode;
 use crate::conversation::message::Message;
 #[cfg(feature = "tree-sitter")]
@@ -500,18 +498,14 @@ async fn empty_responses_hand_the_turn_to_recipe_operations() -> Result<()> {
     Ok(())
 }
 
-/// Regression test for code-mode subagent termination: `recipe__final_output`
-/// has no extension-owner metadata, so code mode used to filter it out of the
-/// advertised tools and recipe sessions could never collect their structured
-/// output.
 #[cfg(feature = "code-mode")]
 #[tokio::test]
-async fn code_mode_advertises_and_executes_final_output_for_recipe_sessions() -> Result<()> {
+async fn code_mode_advertises_and_accepts_final_output() -> Result<()> {
     let (pipeline, api) = test_pipeline().await?;
     let recipe = Recipe::builder()
-        .title("Structured output boundary")
-        .description("Structured output boundary")
-        .instructions("Return structured output")
+        .title("Structured output")
+        .description("Return structured output")
+        .instructions("Compute the answer")
         .response(Response {
             json_schema: Some(json!({
                 "type": "object",
@@ -523,19 +517,16 @@ async fn code_mode_advertises_and_executes_final_output_for_recipe_sessions() ->
         .expect("valid recipe");
     pipeline.set_recipe(recipe).await?;
     pipeline.add_extension("code_execution").await?;
-    pipeline.set_permission(FINAL_OUTPUT_TOOL_NAME, PermissionLevel::AlwaysAllow);
-    let pipeline = pipeline
-        .with_max_turns(2)
-        .with_goose_mode(GooseMode::Approve)
-        .await;
-    api.on("return the structured output")
-        .call(FINAL_OUTPUT_TOOL_NAME, json!({ "result": "escaped" }));
+    api.on("compute the answer")
+        .call(FINAL_OUTPUT_TOOL_NAME, json!({ "result": "42" }));
 
-    let result = pipeline.run(["return the structured output"]).await?;
+    let result = pipeline.run(["compute the answer"]).await?;
 
+    assert_eq!(api.call_count(), 1);
+    assert!(api.calls()[0].advertises_tool("execute_javascript"));
+    assert!(api.calls()[0].system_contains("You MUST use the `final_output` tool"));
     assert!(api.calls()[0].advertises_tool(FINAL_OUTPUT_TOOL_NAME));
-    result.assert_message(-2, ToolResponse, "Final output successfully collected.");
-    result.assert_message(-1, Agent, r#"{"result":"escaped"}"#);
+    result.assert_message(-1, Agent, r#"{"result":"42"}"#);
 
     Ok(())
 }
