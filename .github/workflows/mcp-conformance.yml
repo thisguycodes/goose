@@ -21,6 +21,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # fork: share ci.yml's ci-linux cache union (same runner/toolchain,
+          # debug build artifacts) to stay under the 10GB Actions cache quota
+          cache-shared-key: ci-linux
 
       - name: Install Dependencies
         run: |
@@ -28,6 +32,11 @@ jobs:
           sudo apt install -y libdbus-1-dev libxcb1-dev
 
       - name: Cache Cargo artifacts
+        # fork: disabled - the setup-rust-toolchain step above owns the cache
+        # lifecycle under the shared ci-linux key; this step created a second,
+        # redundant one. Disabled rather than removed to merge cleanly with
+        # hourly upstream syncs.
+        if: ${{ github.event_name == 'never' }}  # fork: disabled, see comment above
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           key: mcp-conformance
