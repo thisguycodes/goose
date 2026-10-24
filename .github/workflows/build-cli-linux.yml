@@ -117,10 +117,23 @@ jobs:
             git \
             tar
 
+      # fork: disabled — this step ran before any Rust toolchain existed, so
+      # rust-cache's `rustc -vV` probe failed on container legs and the cache
+      # silently never restored or saved. Replaced by the step below, which
+      # installs the toolchain first and caches with a key that reflects it.
       - name: Cache Cargo artifacts
+        if: false
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           key: ${{ matrix.architecture }}-${{ matrix.target-suffix }}-${{ matrix.build-on }}-${{ matrix.container || 'native' }}
+
+      # fork addition: same action and pin as ci.yml; installs the toolchain
+      # (and build target) first, then restores the cargo cache.
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          target: ${{ matrix.architecture }}-${{ matrix.target-suffix }}
+          cache-key: ${{ matrix.architecture }}-${{ matrix.target-suffix }}-${{ matrix.build-on }}-${{ matrix.container || 'native' }}
 
       - name: Build CLI (host runner)
         if: matrix.container == ''
@@ -129,6 +142,9 @@ jobs:
           RUST_BACKTRACE: 1
         run: |
           source ./bin/activate-hermit
+          # fork: use the non-hermit rust toolchain (same pattern as ci.yml) so
+          # the action-installed toolchain above is the one cargo invokes
+          hermit uninstall rustup
           export TARGET="${{ matrix.architecture }}-${{ matrix.target-suffix }}"
           rustup target add "${TARGET}"
           echo "Building for target: ${TARGET}"
@@ -148,8 +164,11 @@ jobs:
             cargo build --release --target ${TARGET} -p goose-cli --bin goose "${FEATURE_ARGS[@]}"
           fi
 
+      # fork: disabled — the toolchain bootstrap this step did is now handled by
+      # the setup-rust-toolchain step above (which also makes the cache work);
+      # the replacement build step is below.
       - name: Build CLI (manylinux container)
-        if: matrix.container != ''
+        if: false
         env:
           RUST_BACKTRACE: 1
         run: |
@@ -168,6 +187,15 @@ jobs:
             --component rustc,cargo --target "$TARGET"
           rustup show
           cargo build --release --target "$TARGET" -p goose-cli --bin goose
+
+      # fork addition: build using the toolchain installed above (PATH and the
+      # target are set up by the action); the original step is kept disabled.
+      - name: Build CLI (manylinux container, cached toolchain)
+        if: matrix.container != ''
+        env:
+          RUST_BACKTRACE: 1
+          TARGET: ${{ matrix.architecture }}-${{ matrix.target-suffix }}
+        run: cargo build --release --target "$TARGET" -p goose-cli --bin goose
 
       - name: Package CLI
         run: |
