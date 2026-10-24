@@ -30,6 +30,7 @@ concurrency:
 jobs:
   release-pr:
     name: Create or update GDK release PR
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
