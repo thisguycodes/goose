@@ -129,6 +129,9 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
+          # kept separate from the ci-linux cache union: profile.lean inherits
+          # release with fat LTO and panic=abort, so its artifacts are
+          # incompatible with the debug-profile jobs
           cache-key: lean-acp
 
       - name: Build lean configuration and check its size budget
@@ -223,7 +226,10 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          cache-key: ${{ matrix.tls-feature }}
+          # share the ci-linux cache union: both TLS legs run cargo test with
+          # the same toolchain, so feature-variant fingerprints coexist in one
+          # entry instead of two per-feature caches (10GB quota pressure)
+          cache-shared-key: ci-linux
 
       - name: Install Dependencies
         run: |
