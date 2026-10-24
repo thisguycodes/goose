@@ -15,6 +15,13 @@ on:
 
 name: Live Provider Tests
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check-fork:
     runs-on: ubuntu-latest
@@ -70,15 +77,20 @@ jobs:
           ref: ${{ github.event.inputs.branch || github.ref }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache-shared-key: ci-linux
 
       - name: Install Dependencies
         run: |
           sudo apt update -y
           sudo apt install -y libdbus-1-dev gnome-keyring libxcb1-dev
+          sudo apt install -y mold
 
       - name: Build Binary for Smoke Tests
         run: |
           cargo build --bin goose
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
       - name: Upload goose binary
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
