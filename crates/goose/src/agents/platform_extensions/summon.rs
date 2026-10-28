@@ -1261,9 +1261,10 @@ impl SummonClient {
                     .map(String::as_str)
                     .collect();
                 if !unmatched.is_empty() {
-                    warn!(
+                    anyhow::bail!(
                         "Delegate requested extensions not available: {:?}. Available: {:?}",
-                        unmatched, available_keys
+                        unmatched,
+                        available_keys
                     );
                 }
             }
@@ -2958,6 +2959,38 @@ You review code."#;
                 .collect::<Vec<_>>(),
             vec!["Exa Search"]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn delegate_rejects_unavailable_extension_keys() -> Result<()> {
+        let _env = env_lock::lock_env([
+            ("GOOSE_SUBAGENT_PROVIDER", Some("openai")),
+            ("GOOSE_SUBAGENT_MODEL", Some("test-model")),
+        ]);
+        let client = SummonClient::new(create_test_context())?;
+        let parent = session_with(goose_providers::model::ModelConfig::new("test-model"));
+        let mut recipe = empty_recipe();
+        recipe.extensions = Recipe::from_content(
+            "title: Child\ndescription: Child\nprompt: Run\nextensions:\n  - type: stdio\n    name: Exa Search\n    cmd: exa-mcp\n    args: []\n",
+        )?.extensions;
+        for filter in ["exaserch", "Exa Search"] {
+            let params = DelegateParams {
+                extensions: Some(vec![filter.to_string()]),
+                ..Default::default()
+            };
+            let err = match client
+                .resolve_subagent_config(&params, &recipe, &parent)
+                .await
+            {
+                Err(err) => err,
+                Ok(_) => panic!("unavailable extension '{filter}' should fail fast"),
+            };
+            let message = err.to_string();
+            assert!(message.contains(filter), "unexpected error: {message}");
+            assert!(message.contains("exasearch"), "unexpected error: {message}");
+        }
         Ok(())
     }
 }
