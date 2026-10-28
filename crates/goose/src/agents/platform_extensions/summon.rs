@@ -492,7 +492,7 @@ impl SummonClient {
                 "extensions": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Restrict extensions by name. Omit to use the source recipe's declared extensions, or inherit the parent's if none are declared. Empty array for none."
+                    "description": "Restrict extensions by key (the lowercase prefix used in tool names, e.g. 'developer' for developer__shell). Omit to use the source recipe's declared extensions, or inherit the parent's if none are declared. Empty array for none."
                 },
                 "provider": {
                     "type": "string",
@@ -1253,18 +1253,17 @@ impl SummonClient {
             if filter.is_empty() {
                 extensions = Vec::new();
             } else {
-                let available_names: Vec<String> =
-                    extensions.iter().map(|ext| ext.name()).collect();
-                extensions.retain(|ext| filter.contains(&ext.name()));
+                let available_keys: Vec<String> = extensions.iter().map(|ext| ext.key()).collect();
+                extensions.retain(|ext| filter.contains(&ext.key()));
                 let unmatched: Vec<&str> = filter
                     .iter()
-                    .filter(|name| !available_names.iter().any(|n| n == *name))
+                    .filter(|name| !available_keys.iter().any(|k| k == *name))
                     .map(String::as_str)
                     .collect();
                 if !unmatched.is_empty() {
                     warn!(
                         "Delegate requested extensions not available: {:?}. Available: {:?}",
-                        unmatched, available_names
+                        unmatched, available_keys
                     );
                 }
             }
@@ -2929,5 +2928,36 @@ You review code."#;
         assert!(error
             .to_string()
             .contains("No model configured for provider 'lmstudio'"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn delegate_extension_filter_matches_by_key() -> Result<()> {
+        let _env = env_lock::lock_env([
+            ("GOOSE_SUBAGENT_PROVIDER", Some("openai")),
+            ("GOOSE_SUBAGENT_MODEL", Some("test-model")),
+        ]);
+        let client = SummonClient::new(create_test_context())?;
+        let parent = session_with(goose_providers::model::ModelConfig::new("test-model"));
+        let mut recipe = empty_recipe();
+        recipe.extensions = Recipe::from_content(
+            "title: Child\ndescription: Child\nprompt: Run\nextensions:\n  - type: stdio\n    name: Exa Search\n    cmd: exa-mcp\n    args: []\n",
+        )?.extensions;
+        let params = DelegateParams {
+            extensions: Some(vec!["exasearch".to_string()]),
+            ..Default::default()
+        };
+        let resolved = client
+            .resolve_subagent_config(&params, &recipe, &parent)
+            .await?;
+        assert_eq!(
+            resolved
+                .extensions
+                .iter()
+                .map(|config| config.name())
+                .collect::<Vec<_>>(),
+            vec!["Exa Search"]
+        );
+        Ok(())
     }
 }
