@@ -1,6 +1,7 @@
 ---
 title: Set up goose in Zed
-sidebar_position: 3
+sidebar_position: 10
+displayed_sidebar: tutorialSidebar
 description: See how Zed installs and configures goose as an ACP agent.
 ---
 

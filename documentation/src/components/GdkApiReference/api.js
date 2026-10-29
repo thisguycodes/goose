@@ -2,20 +2,16 @@
 // mirror the uniffi 0.32 code generators, which are the actual source of the
 // Python and Kotlin bindings.
 
-export type LanguageId = "rust" | "python" | "kotlin";
-
-const toSnake = (name: string) => name;
-const toCamel = (name: string) =>
-  name.replace(/_([a-z0-9])/g, (_, char: string) => char.toUpperCase());
-const toShoutySnake = (name: string) =>
+const toSnake = (name) => name;
+const toCamel = (name) =>
+  name.replace(/_([a-z0-9])/g, (_, char) => char.toUpperCase());
+const toShoutySnake = (name) =>
   name
     .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
     .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
     .toUpperCase();
 
-type Scalars = Record<string, string>;
-
-const PYTHON_SCALARS: Scalars = {
+const PYTHON_SCALARS = {
   String: "str",
   bool: "bool",
   i8: "int",
@@ -31,7 +27,7 @@ const PYTHON_SCALARS: Scalars = {
   "()": "None",
 };
 
-const KOTLIN_SCALARS: Scalars = {
+const KOTLIN_SCALARS = {
   String: "String",
   bool: "Boolean",
   i8: "Byte",
@@ -47,10 +43,10 @@ const KOTLIN_SCALARS: Scalars = {
   "()": "Unit",
 };
 
-const generic = (type: string, name: string): string[] | null => {
+const generic = (type, name) => {
   const match = new RegExp(`^${name}\\s*<(.+)>$`, "s").exec(type.trim());
   if (!match) return null;
-  const args: string[] = [];
+  const args = [];
   let depth = 0;
   let current = "";
   for (const char of match[1]) {
@@ -67,7 +63,7 @@ const generic = (type: string, name: string): string[] | null => {
   return args;
 };
 
-const mapType = (type: string, language: LanguageId): string => {
+const mapType = (type, language) => {
   const trimmed = type.trim();
   if (language === "rust") return trimmed;
 
@@ -92,35 +88,28 @@ const mapType = (type: string, language: LanguageId): string => {
   const map = generic(trimmed, "HashMap");
   if (map) {
     const [key, value] = map.map((arg) => mapType(arg, language));
-    return language === "python" ? `dict[${key}, ${value}]` : `Map<${key}, ${value}>`;
+    return language === "python"
+      ? `dict[${key}, ${value}]`
+      : `Map<${key}, ${value}>`;
   }
 
   return trimmed;
 };
 
-const mapDefault = (value: string, language: LanguageId): string => {
+const mapDefault = (value, language) => {
   if (language === "rust") return value;
   if (value === "None") return language === "python" ? "None" : "null";
   if (value === "true" || value === "false") {
-    return language === "python" ? (value === "true" ? "True" : "False") : value;
+    return language === "python"
+      ? value === "true"
+        ? "True"
+        : "False"
+      : value;
   }
   return value;
 };
 
-export type Language = {
-  id: LanguageId;
-  label: string;
-  /** Prism language for syntax highlighting. */
-  prism: string;
-  func: (name: string) => string;
-  field: (name: string) => string;
-  variant: (name: string, isDataCarrying: boolean) => string;
-  type: (type: string) => string;
-  default: (value: string) => string;
-  errorType: (name: string) => string;
-};
-
-export const LANGUAGES: Language[] = [
+const LANGUAGES = [
   {
     id: "rust",
     label: "Rust",
@@ -140,7 +129,8 @@ export const LANGUAGES: Language[] = [
     field: toSnake,
     // Flat enums become `enum.Enum` members; data-carrying variants become
     // nested dataclasses that keep their Rust casing.
-    variant: (name, isDataCarrying) => (isDataCarrying ? name : toShoutySnake(name)),
+    variant: (name, isDataCarrying) =>
+      isDataCarrying ? name : toShoutySnake(name),
     type: (type) => mapType(type, "python"),
     default: (value) => mapDefault(value, "python"),
     errorType: (name) => name,
@@ -153,9 +143,73 @@ export const LANGUAGES: Language[] = [
     field: toCamel,
     // Flat enums become `enum class` entries; data-carrying variants become
     // `sealed class` subclasses that keep their Rust casing.
-    variant: (name, isDataCarrying) => (isDataCarrying ? name : toShoutySnake(name)),
+    variant: (name, isDataCarrying) =>
+      isDataCarrying ? name : toShoutySnake(name),
     type: (type) => mapType(type, "kotlin"),
     default: (value) => mapDefault(value, "kotlin"),
     errorType: (name) => name.replace(/Error$/, "Exception"),
   },
 ];
+
+const slug = (...parts) =>
+  parts
+    .join("-")
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .toLowerCase();
+
+const funcAnchor = (func, owner) => slug(owner ?? "fn", func.name);
+const itemAnchor = (item) => slug(item.name);
+const memberAnchor = (ownerAnchor, kind, name) => slug(ownerAnchor, kind, name);
+
+function signature(func, language, owner) {
+  const params = func.params
+    .map((param) => {
+      const type = language.type(param.type);
+      const suffix = param.default
+        ? ` = ${language.default(param.default)}`
+        : "";
+      return `${language.field(param.name)}: ${type}${suffix}`;
+    })
+    .join(", ");
+
+  const name = language.func(func.name);
+  const returns = func.returns ? language.type(func.returns) : null;
+  const prefix = owner ? `${owner}.` : "";
+
+  if (language.id === "rust") {
+    const asyncKeyword = func.isAsync ? "async " : "";
+    const result = func.throws
+      ? `Result<${returns ?? "()"}, ${func.throws}>`
+      : returns;
+    return `${asyncKeyword}fn ${prefix}${name}(${params})${result ? ` -> ${result}` : ""}`;
+  }
+
+  if (language.id === "python") {
+    const asyncKeyword = func.isAsync ? "async " : "";
+    return `${asyncKeyword}def ${prefix}${name}(${params})${returns ? ` -> ${returns}` : ""}`;
+  }
+
+  const suspend = func.isAsync ? "suspend " : "";
+  const throwsAnnotation = func.throws
+    ? `@Throws(${language.errorType(func.throws)}::class)\n`
+    : "";
+  return `${throwsAnnotation}${suspend}fun ${prefix}${name}(${params})${returns ? `: ${returns}` : ""}`;
+}
+
+function variantName(item, variant, language) {
+  if (item.kind === "error" && language.id === "kotlin") {
+    return `${language.errorType(item.name)}.${variant.name}`;
+  }
+  const dataCarrying = item.variants.some((entry) => entry.fields.length > 0);
+  return language.variant(variant.name, dataCarrying);
+}
+
+module.exports = {
+  LANGUAGES,
+  slug,
+  funcAnchor,
+  itemAnchor,
+  memberAnchor,
+  signature,
+  variantName,
+};
