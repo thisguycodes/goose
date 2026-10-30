@@ -62,12 +62,14 @@ pub(super) use ops_doctor::DoctorOperation;
 pub(super) use ops_empty_response::EmptyResponseOperation;
 pub(crate) use ops_exit_on_error::turn_failure;
 pub(super) use ops_exit_on_error::ExitOnErrorOperation;
-pub(super) use ops_llm::{GooseInferenceProvider, InferenceRunner};
+pub(super) use ops_llm::{enrich_unclaimed_tool_errors, GooseInferenceProvider, InferenceRunner};
 pub(super) use ops_maxturns::{MaxTurnsOperation, MAX_TURNS_MESSAGE};
 pub(super) use ops_project::ProjectOperation;
 pub(super) use ops_pursue::PursueOperation;
 pub(super) use ops_recipe::RecipeOperation;
 pub(super) use ops_remaining_tool_calls::RemainingToolCallsOperation;
+#[cfg(test)]
+pub(super) use ops_remaining_tool_calls::UNCLAIMED_TOOL_ERROR;
 pub(super) use ops_retry::RetryOperation;
 pub(super) use ops_skills::SkillOperation;
 pub(super) use ops_slash_command::SlashCommandOperation;

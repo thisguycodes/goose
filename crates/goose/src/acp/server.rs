@@ -99,6 +99,7 @@ mod agent_mentions;
 use crate::agents::{ActiveRunRegistry, StartRunError};
 mod apps;
 mod config;
+mod context_report;
 mod custom_dispatch;
 mod diagnostics;
 mod dictation;

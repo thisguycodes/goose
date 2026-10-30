@@ -54,7 +54,7 @@ static COMMANDS: &[CommandDef] = &[
     },
     CommandDef {
         name: "status",
-        description: "Show session status: model, provider, mode, and token usage",
+        description: "Show session status: session ID, model, provider, mode, and token usage",
     },
 ];
 

@@ -14,6 +14,7 @@ pub(crate) mod declarative_providers {
 
     expose_declarative_providers!(
         aigateway,
+        aihubmix,
         aimlapi,
         alibaba,
         atomic_chat,
@@ -50,6 +51,7 @@ pub(crate) mod declarative_providers {
         ovhcloud,
         perplexity,
         pleumrouter,
+        routerplex,
         routstr,
         sakana,
         saladcloud,

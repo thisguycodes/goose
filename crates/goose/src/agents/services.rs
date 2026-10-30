@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -11,7 +11,7 @@ use tracing_futures::Instrument;
 use super::gen_ai_telemetry;
 use super::tool_confirmation_coordinator::{ActiveTurnGuard, ConfirmationAnswer};
 use crate::action_required_manager::ElicitationOutcome;
-use crate::agents::extension_manager::{ClientContext, ExtensionManager};
+use crate::agents::extension_manager::{ClientContext, ExtensionLease, ExtensionManager};
 use crate::agents::provider_manager::ProviderManager;
 use crate::agents::session_runtime::{Attachment, SessionRuntime};
 use crate::agents::state_machine::ops_recipe;
@@ -725,16 +725,39 @@ impl StateMachineServices {
         cancel: CancellationToken,
         steer_queue: SteerQueue,
     ) -> StateMachine<'_, Session, GooseEffect> {
-        let settings = match &self.turn_settings {
-            Some(settings) => settings.clone(),
-            None => TurnSettings::from_config(provider.as_ref(), &model_config),
-        };
-        let max_turns = session_config.max_turns.unwrap_or(settings.max_turns);
         let extension_lease = self
             .runtime
             .confirmations
             .session(&session_config.id)
             .extension_lease();
+        self.create_state_machine_with_lease(
+            provider,
+            model_config,
+            context_limit,
+            session_config,
+            cancel,
+            steer_queue,
+            extension_lease,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn create_state_machine_with_lease(
+        self: &Arc<Self>,
+        provider: Arc<dyn Provider>,
+        model_config: goose_providers::model::ModelConfig,
+        context_limit: usize,
+        session_config: SessionConfig,
+        cancel: CancellationToken,
+        steer_queue: SteerQueue,
+        extension_lease: Arc<StdMutex<Option<Arc<ExtensionLease>>>>,
+    ) -> StateMachine<'_, Session, GooseEffect> {
+        let settings = match &self.turn_settings {
+            Some(settings) => settings.clone(),
+            None => TurnSettings::from_config(provider.as_ref(), &model_config),
+        };
+        let max_turns = session_config.max_turns.unwrap_or(settings.max_turns);
         let compaction_threshold = crate::context_mgmt::capped_compaction_threshold(
             settings.compaction_threshold,
             settings.compaction_token_limit,
