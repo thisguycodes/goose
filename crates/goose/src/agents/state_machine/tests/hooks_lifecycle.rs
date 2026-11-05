@@ -5,6 +5,9 @@ use serde_json::Value;
 use super::calculator_extension::{value, ADD};
 use super::pipeline::{test_pipeline, MessageKind::Agent, MessageKind::ToolResponse, MAX_TURNS};
 use crate::agents::final_output_tool::{FINAL_OUTPUT_NOT_ALONE_MESSAGE, FINAL_OUTPUT_TOOL_NAME};
+use crate::agents::state_machine::ops_pursue::{
+    PURSUE_DONE_MISSING_SUMMARY_MESSAGE, PURSUE_DONE_NOT_ALONE_MESSAGE, PURSUE_DONE_TOOL_NAME,
+};
 use crate::agents::state_machine::ops_remaining_tool_calls::UNCLAIMED_TOOL_ERROR;
 use crate::agents::tool_execution::{CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
 use crate::config::permission::PermissionLevel;
@@ -711,6 +714,119 @@ async fn final_output_beside_another_call_is_rejected_until_called_alone() -> Re
             .count(),
         1
     );
+    Ok(())
+}
+
+fn pursue_payloads(env: &RecordingHookEnv, log: &str) -> Vec<serde_json::Value> {
+    env.payloads(log)
+        .into_iter()
+        .filter(|payload| payload["tool_name"] == PURSUE_DONE_TOOL_NAME)
+        .collect()
+}
+
+#[tokio::test]
+async fn pursue_done_emits_tool_hooks_with_one_tool_call_id() -> Result<()> {
+    let env = recording_lifecycle_env();
+    let (pipeline, api) = test_pipeline().await?;
+    let pipeline = pipeline.with_hook_manager(env.hook_manager());
+    pipeline
+        .set_pursue(Some("finish the migration".to_string()))
+        .await;
+    api.on("go").call(
+        PURSUE_DONE_TOOL_NAME,
+        serde_json::json!({"summary": "migration finished"}),
+    );
+
+    pipeline.run(["go"]).await?;
+
+    let pres = pursue_payloads(&env, "pre.log");
+    let results = pursue_payloads(&env, "result.log");
+    let posts = pursue_payloads(&env, "post.log");
+    assert_eq!(pres.len(), 1, "PreToolUse must fire for pursue__done");
+    assert_eq!(
+        results.len(),
+        1,
+        "PreToolUseResult must fire for pursue__done"
+    );
+    assert_eq!(posts.len(), 1, "PostToolUse must fire for pursue__done");
+    assert!(pursue_payloads(&env, "postfail.log").is_empty());
+    assert_eq!(results[0]["decision"], "allow");
+    assert_eq!(posts[0]["event"], "PostToolUse");
+    assert!(pres[0]["tool_call_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert_eq!(pres[0]["tool_call_id"], results[0]["tool_call_id"]);
+    assert_eq!(posts[0]["tool_call_id"], pres[0]["tool_call_id"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pursue_done_beside_another_call_skips_hooks_until_called_alone() -> Result<()> {
+    let env = recording_lifecycle_env();
+    let (pipeline, api) = test_pipeline().await?;
+    let pipeline = pipeline.with_hook_manager(env.hook_manager());
+    pipeline.set_pursue(Some("finish".to_string())).await;
+    api.on("finish and add").calls([
+        (
+            "early-done",
+            PURSUE_DONE_TOOL_NAME,
+            serde_json::json!({"summary": "guess"}),
+        ),
+        ("side-effect", ADD, value(1)),
+    ]);
+    api.on(PURSUE_DONE_NOT_ALONE_MESSAGE).call(
+        PURSUE_DONE_TOOL_NAME,
+        serde_json::json!({"summary": "done"}),
+    );
+
+    pipeline.run(["finish and add"]).await?;
+
+    assert_eq!(pipeline.calculator_total(), 1);
+    let pre_hooked: Vec<_> = env
+        .payloads("pre.log")
+        .iter()
+        .map(|payload| payload["tool_call_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!pre_hooked.contains(&"early-done".to_string()));
+    assert!(pre_hooked.contains(&"side-effect".to_string()));
+    let pres = pursue_payloads(&env, "pre.log");
+    assert_eq!(
+        pres.len(),
+        1,
+        "only the retried alone call runs the pre-hook"
+    );
+    let posts = pursue_payloads(&env, "post.log");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0]["tool_call_id"], pres[0]["tool_call_id"]);
+    assert!(
+        pursue_payloads(&env, "postfail.log").is_empty(),
+        "the rejected sibling completion must not emit PostToolUseFailure"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pursue_done_missing_summary_emits_post_tool_use_failure() -> Result<()> {
+    let env = recording_lifecycle_env();
+    let (pipeline, api) = test_pipeline().await?;
+    let pipeline = pipeline.with_hook_manager(env.hook_manager());
+    pipeline.set_pursue(Some("finish".to_string())).await;
+    api.on("go")
+        .call(PURSUE_DONE_TOOL_NAME, serde_json::json!({}));
+    api.on(PURSUE_DONE_MISSING_SUMMARY_MESSAGE).call(
+        PURSUE_DONE_TOOL_NAME,
+        serde_json::json!({"summary": "done"}),
+    );
+
+    pipeline.run(["go"]).await?;
+
+    assert_eq!(
+        pursue_payloads(&env, "pre.log").len(),
+        2,
+        "both alone attempts run the pre-hook"
+    );
+    assert_eq!(pursue_payloads(&env, "postfail.log").len(), 1);
+    assert_eq!(pursue_payloads(&env, "post.log").len(), 1);
     Ok(())
 }
 
