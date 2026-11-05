@@ -19,6 +19,7 @@ use super::pipeline::calculator_extension;
 use crate::acp::server::AcpConnection;
 use crate::agents::extension::ExtensionConfig;
 use crate::agents::mcp_client::McpClientTrait;
+use crate::agents::state_machine::ops_pursue::PURSUE_DONE_TOOL_NAME;
 use crate::agents::state_machine::ops_toolcalling::EXPIRED_APPROVAL_RESPONSE;
 use crate::agents::{
     AgentEvent, GoosePlatform, SessionConfig, StateMachineServices, StateMachineServicesConfig,
@@ -28,7 +29,7 @@ use crate::config::GooseMode;
 use crate::conversation::message::{ActionRequiredData, Message, MessageContent};
 use crate::permission::Permission;
 use crate::providers::base::Provider;
-use crate::session::{SessionManager, SessionType};
+use crate::session::{GoalState, SessionManager, SessionType};
 use goose_providers::model::ModelConfig;
 
 async fn agent_with_dummy_api() -> Result<(
@@ -323,7 +324,7 @@ async fn state_machine_confirmation_through_agent_resumes_tool_call() -> Result<
         .lines()
         .map(serde_json::from_str::<serde_json::Value>)
         .collect::<serde_json::Result<Vec<_>>>()?;
-    assert_eq!(hook_payloads.len(), 2);
+    assert_eq!(hook_payloads.len(), 1);
     assert!(hook_payloads.iter().all(|payload| {
         payload["working_dir"].as_str() == Some(temp_dir.path().to_string_lossy().as_ref())
     }));
@@ -462,6 +463,62 @@ async fn stop_at_a_confirmation_interrupts_the_waiting_call() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_tool_use_reports_the_leased_working_dir_after_a_mid_run_change() -> Result<()> {
+    let (hooks, _hook_dir, hook_log_path) = hook_log(&["PreToolUse"], 0)?;
+    let (services, api, session_id, calculator, temp_dir) = agent_with_calculator(hooks).await?;
+    services
+        .update_goose_mode(GooseMode::Auto, &session_id)
+        .await?;
+
+    let model_reply = api.on("add one").hold_call(ADD, value(1));
+    api.on("result: 1").reply("the result is one");
+
+    let session_config = SessionConfig {
+        id: session_id,
+        schedule_id: None,
+        max_turns: Some(2),
+    };
+    let stream = services
+        .reply(
+            Message::user().with_text("add one"),
+            session_config.clone(),
+            Some(CancellationToken::new()),
+        )
+        .await?;
+    let new_working_dir = tempfile::tempdir()?;
+    let change_working_dir = async {
+        model_reply.entered().await;
+        services
+            .session_manager
+            .update(&session_config.id)
+            .working_dir(new_working_dir.path().to_path_buf())
+            .apply()
+            .await?;
+        model_reply.release();
+        anyhow::Ok(())
+    };
+    let (messages, changed) = tokio::join!(stream_messages(stream), change_working_dir);
+    messages?;
+    changed?;
+
+    assert_eq!(calculator.total(), 1);
+    let leased_working_dir = temp_dir.path().to_string_lossy().to_string();
+    assert!(calculator
+        .contexts()
+        .iter()
+        .all(|context| context.working_dir.as_deref() == Some(temp_dir.path())));
+    let working_dirs = std::fs::read_to_string(hook_log_path)?
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .map(|payload| payload["working_dir"].as_str().map(str::to_string))
+        })
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    assert_eq!(working_dirs, vec![Some(leased_working_dir)]);
+    Ok(())
+}
+
 #[tokio::test]
 async fn state_machine_skill_approval_uses_its_leased_working_dir() -> Result<()> {
     let (services, api, session_id, old_working_dir) = agent_with_dummy_api().await?;
@@ -586,8 +643,8 @@ async fn state_machine_rejects_resumed_skill_approval_without_its_lease() -> Res
 
 #[tokio::test]
 async fn state_machine_rejects_resumed_approval_without_its_lease() -> Result<()> {
-    let (services, api, session_id, calculator, _temp_dir) =
-        agent_with_calculator(crate::hooks::HookManager::default()).await?;
+    let (hooks, _hook_dir, hook_log_path) = hook_log(&["PreToolUse"], 0)?;
+    let (services, api, session_id, calculator, _temp_dir) = agent_with_calculator(hooks).await?;
 
     api.on("add one").call(ADD, value(1));
     api.on(EXPIRED_APPROVAL_RESPONSE).reply("request it again");
@@ -645,6 +702,89 @@ async fn state_machine_rejects_resumed_approval_without_its_lease() -> Result<()
                 .is_some_and(|text| text.contains(EXPIRED_APPROVAL_RESPONSE))
         }));
     assert_eq!(api.call_count(), 2);
+    assert!(std::fs::read_to_string(&hook_log_path)
+        .unwrap_or_default()
+        .is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn state_machine_runs_pre_hook_for_resumed_pursue_approval_without_its_lease() -> Result<()> {
+    let (hooks, _hook_dir, hook_log_path) = hook_log(&["PreToolUse"], 0)?;
+    let (services, api, session_id, _calculator, _temp_dir) = agent_with_calculator(hooks).await?;
+
+    let session = services
+        .session_manager
+        .get_session(&session_id, true)
+        .await?;
+    let mut state = GoalState::of(&session);
+    state.pursue = Some("finish".to_string());
+    services
+        .session_manager
+        .set_extension_state(&session_id, &state)
+        .await?;
+
+    api.on("go").call(
+        PURSUE_DONE_TOOL_NAME,
+        serde_json::json!({"summary": "done"}),
+    );
+
+    let session_config = SessionConfig {
+        id: session_id.clone(),
+        schedule_id: None,
+        max_turns: Some(3),
+    };
+    let mut stream = services
+        .reply(
+            Message::user().with_text("go"),
+            session_config.clone(),
+            Some(CancellationToken::new()),
+        )
+        .await?;
+    let confirmation_id = loop {
+        let event = stream
+            .next()
+            .await
+            .expect("state machine should request confirmation")?;
+        if let AgentEvent::Message(message) = event {
+            let confirmation_id = confirmation_ids(std::slice::from_ref(&message)).pop();
+            if let Some(confirmation_id) = confirmation_id {
+                break confirmation_id;
+            }
+        }
+    };
+
+    services
+        .runtime
+        .confirmations
+        .session(&session_config.id)
+        .clear_extension_lease();
+    services
+        .submit_tool_confirmation(&session_config.id, &confirmation_id, Permission::AllowOnce)
+        .await?;
+    stream_messages(stream).await?;
+
+    let hooked: Vec<String> = std::fs::read_to_string(&hook_log_path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|payload| payload["event"].as_str() == Some("PreToolUse"))
+        .filter_map(|payload| payload["tool_name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        hooked.iter().any(|name| name == PURSUE_DONE_TOOL_NAME),
+        "PreToolUse must run for a resumed pursue__done approval even without its lease"
+    );
+
+    let session = services
+        .session_manager
+        .get_session(&session_config.id, true)
+        .await?;
+    assert!(
+        GoalState::of(&session).pursue.is_none(),
+        "the hook-allowed completion still executes"
+    );
 
     Ok(())
 }
