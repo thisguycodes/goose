@@ -254,6 +254,22 @@ impl TestPipeline {
         self.reconstruct().await
     }
 
+    pub(super) fn provider(&self) -> &dyn Provider {
+        self.provider.as_ref()
+    }
+
+    pub(super) fn with_context_relevance(
+        mut self,
+        decisions: Arc<dyn goose_providers::decision::DecisionProvider>,
+    ) -> Self {
+        assert!(
+            !self.services.initialized(),
+            "configure the pipeline before using it"
+        );
+        self.turn_settings.context_relevance = Some(decisions);
+        self
+    }
+
     pub(super) fn with_max_turns(mut self, max_turns: u32) -> Self {
         self.max_turns = max_turns;
         self
@@ -912,6 +928,7 @@ async fn build_test_pipeline(
             compaction_token_limit: usize::MAX,
             tool_call_cutoff: None,
             auto_effort: None,
+            context_relevance: None,
         },
         max_turns: MAX_TURNS,
         session_id: session.id.clone(),
@@ -1222,13 +1239,15 @@ impl TestRun {
     }
 }
 
-const TOOL_OPERATIONS: [&str; 6] = [
+const TOOL_OPERATIONS: [&str; 8] = [
     "tool_approval",
+    "pre_tool_call_hook",
     "skills",
     "recipe",
     "pursue",
     "tool_execution",
     "remaining_tool_calls",
+    "unhandled_tool_calls",
 ];
 
 fn assert_only_tool_operations_act_on_open_calls(session: &Session, applied_step: Option<&str>) {
