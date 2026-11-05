@@ -140,7 +140,10 @@ pub(crate) fn build_state_machine(
         )),
         // Before ToolExecutionOperation so it executes its own pursue__done tool,
         // and before MaxTurnsOperation so a pursuit is never turn-capped.
-        Arc::new(PursueOperation::new(provider.clone())),
+        Arc::new(PursueOperation::new(
+            provider.clone(),
+            Arc::clone(&post_tool_call_hook),
+        )),
         Arc::new(ToolExecutionOperation::new(
             Arc::clone(&extension_manager),
             hook_manager.clone(),
