@@ -6,29 +6,44 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use goose_agent::max_turns::MaxTurnsOperation;
+use goose_agent::post_tool_call_hook::PostToolCallHook;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorCode, ErrorData, Tool, ToolAnnotations};
 
 use crate::agents::state_machine::ops_final_output::has_sibling_tool_calls;
 use crate::agents::state_machine::ops_toolcalling::{
     pending_advertised_tool_requests, ToolDisposition,
 };
+use crate::agents::state_machine::post_tool_hook::run_post_tool_call_hook;
 use crate::agents::state_machine::{
     applied, ends_turn, messages_since_kickoff, not_applicable, yielded_with, ConversationEffect,
     Emitter, GooseEffect, Operation, OperationResult, SlashCommand,
 };
 use crate::config::GooseMode;
-use crate::conversation::message::{Message, SystemNotificationType, ToolRequest};
+use crate::conversation::message::{Message, SystemNotificationType, ToolRequest, ToolResponse};
 use crate::conversation::Conversation;
 use crate::providers::base::Provider;
 use crate::session::{GoalState, Session};
 
 pub const PURSUE_DONE_TOOL_NAME: &str = "pursue__done";
 pub const PURSUE_DONE_SUCCESS_MESSAGE: &str = "Pursue goal marked complete.";
-const PURSUE_DONE_NOT_ALONE_MESSAGE: &str =
+pub const PURSUE_DONE_NOT_ALONE_MESSAGE: &str =
     "pursue__done was not accepted because it was called together with other tools. \
      Read the results of those tools, then call pursue__done on its own.";
-const PURSUE_DONE_MISSING_SUMMARY_MESSAGE: &str =
+pub const PURSUE_DONE_MISSING_SUMMARY_MESSAGE: &str =
     "pursue__done requires a non-empty `summary` string argument.";
+
+/// A sibling completion is rejected without running, so approval and lifecycle
+/// hooks must skip it just like the operation itself does.
+pub(super) fn pursue_done_called_with_other_tools(
+    messages: &[Message],
+    request: &ToolRequest,
+) -> bool {
+    request
+        .tool_call
+        .as_ref()
+        .is_ok_and(|tool_call| tool_call.name == PURSUE_DONE_TOOL_NAME)
+        && has_sibling_tool_calls(messages, &request.id)
+}
 
 fn pursue_done_tool() -> Tool {
     let schema = serde_json::json!({
@@ -71,11 +86,18 @@ fn pursue_prompt(goal: &str) -> String {
 
 pub struct PursueOperation {
     provider: Arc<dyn Provider>,
+    post_tool_call_hook: Arc<dyn PostToolCallHook<Session>>,
 }
 
 impl PursueOperation {
-    pub fn new(provider: Arc<dyn Provider>) -> Self {
-        Self { provider }
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        post_tool_call_hook: Arc<dyn PostToolCallHook<Session>>,
+    ) -> Self {
+        Self {
+            provider,
+            post_tool_call_hook,
+        }
     }
 
     fn done_tool_response(
@@ -85,6 +107,28 @@ impl PursueOperation {
         let mut response = Message::user().with_generated_id_if_missing();
         response.add_tool_response_with_metadata(request.id, result, request.metadata.as_ref());
         response
+    }
+
+    async fn run_done_post_hook(
+        &self,
+        session: &Session,
+        conversation: &Conversation,
+        request: &ToolRequest,
+        result: &Result<CallToolResult, ErrorData>,
+    ) {
+        let tool_response = ToolResponse {
+            id: request.id.clone(),
+            tool_result: result.clone(),
+            metadata: request.metadata.clone(),
+        };
+        run_post_tool_call_hook(
+            self.post_tool_call_hook.as_ref(),
+            session,
+            conversation,
+            request,
+            &tool_response,
+        )
+        .await;
     }
 }
 
@@ -256,22 +300,22 @@ impl Operation<Session, GooseEffect> for PursueOperation {
                 .filter(|summary| !summary.is_empty())
                 .map(str::to_string);
             let Some(summary) = summary else {
-                let response = emit.message(Self::done_tool_response(
-                    request,
-                    Err(ErrorData::new(
-                        ErrorCode::INVALID_PARAMS,
-                        PURSUE_DONE_MISSING_SUMMARY_MESSAGE,
-                        None,
-                    )),
+                let result: std::result::Result<CallToolResult, ErrorData> = Err(ErrorData::new(
+                    ErrorCode::INVALID_PARAMS,
+                    PURSUE_DONE_MISSING_SUMMARY_MESSAGE,
+                    None,
                 ));
+                self.run_done_post_hook(session, conversation, &request, &result)
+                    .await;
+                let response = emit.message(Self::done_tool_response(request, result));
                 return applied([response.into()]);
             };
-            let response = emit.message(Self::done_tool_response(
-                request,
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    PURSUE_DONE_SUCCESS_MESSAGE,
-                )])),
-            ));
+            let result: std::result::Result<CallToolResult, ErrorData> = Ok(
+                CallToolResult::success(vec![ContentBlock::text(PURSUE_DONE_SUCCESS_MESSAGE)]),
+            );
+            self.run_done_post_hook(session, conversation, &request, &result)
+                .await;
+            let response = emit.message(Self::done_tool_response(request, result));
             state.pursue = None;
             let done = emit.message(
                 Message::assistant().with_text(format!("Pursue goal complete:\n\n{summary}")),

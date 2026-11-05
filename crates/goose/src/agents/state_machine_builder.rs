@@ -139,7 +139,10 @@ pub(crate) fn build_state_machine(
             Arc::clone(&post_tool_call_hook),
         )),
         Arc::new(RecipeOperation::new(Arc::clone(&extension_manager))),
-        Arc::new(PursueOperation::new(provider.clone())),
+        Arc::new(PursueOperation::new(
+            provider.clone(),
+            Arc::clone(&post_tool_call_hook),
+        )),
         Arc::new(ToolExecutionOperation::new(
             Arc::clone(&extension_manager),
             hook_manager.clone(),
