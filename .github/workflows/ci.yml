@@ -473,7 +473,8 @@ jobs:
       - rust-lint
       - rust-build-and-test
       - rust-build-and-test-tls
-      - desktop-lint
+      # desktop-lint intentionally not gated: macOS runner allocation flakes on
+      # this fork leave it cancelled with zero steps; it still runs informatively.
     steps:
       - name: Verify required jobs succeeded
         env:
