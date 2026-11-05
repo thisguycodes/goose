@@ -14,7 +14,9 @@ use crate::agents::extension::ExtensionInfo;
 use crate::agents::extension_manager::{CallRequest, ExtensionLease, ExtensionManager};
 use crate::agents::final_output_tool::FINAL_OUTPUT_TOOL_NAME;
 use crate::agents::state_machine::ops_llm::{ADVERTISED_TOOLS_NOTE, LLM_OPERATION_NAME};
-use crate::agents::state_machine::ops_pursue::pursue_done_called_with_other_tools;
+use crate::agents::state_machine::ops_pursue::{
+    pursue_done_called_with_other_tools, PURSUE_DONE_TOOL_NAME,
+};
 use crate::agents::state_machine::ops_recipe::final_output_called_with_other_tools;
 use crate::agents::state_machine::ops_skills::LOAD_SKILL_TOOL_NAME;
 use crate::agents::state_machine::post_tool_hook::run_post_tool_call_hook;
@@ -639,6 +641,7 @@ pub(super) fn approval_expired(
         .map(|tool_call| tool_call.name.as_ref())
     {
         Ok(FINAL_OUTPUT_TOOL_NAME) => false,
+        Ok(PURSUE_DONE_TOOL_NAME) => false,
         Ok(LOAD_SKILL_TOOL_NAME) => true,
         _ => {
             let pending = pending_advertised_tool_requests(messages);
@@ -650,6 +653,7 @@ pub(super) fn approval_expired(
                         *disposition == ToolDisposition::Execute
                             && !request.tool_call.as_ref().is_ok_and(|tool_call| {
                                 tool_call.name == FINAL_OUTPUT_TOOL_NAME
+                                    || tool_call.name == PURSUE_DONE_TOOL_NAME
                                     || tool_call.name == LOAD_SKILL_TOOL_NAME
                             })
                     })
