@@ -16,6 +16,7 @@ use crate::agents::extension::ExtensionInfo;
 use crate::agents::extension_manager::{CallRequest, ExtensionLease, ExtensionManager};
 use crate::agents::reply_parts::is_tool_visible_to_model;
 use crate::agents::state_machine::ops_llm::{ADVERTISED_TOOLS_NOTE, LLM_OPERATION_NAME};
+use crate::agents::state_machine::ops_pursue::pursue_done_called_with_other_tools;
 use crate::agents::state_machine::ops_skills::LOAD_SKILL_TOOL_NAME;
 use crate::agents::state_machine::post_tool_hook::run_post_tool_call_hook;
 use crate::agents::state_machine::{
@@ -706,7 +707,9 @@ pub(super) fn call_will_not_run(
     request: &ToolRequest,
 ) -> Result<bool> {
     let messages = messages_since_kickoff(conversation)?;
-    Ok(session.goose_mode == GooseMode::Chat || !request_was_advertised(messages, request))
+    Ok(session.goose_mode == GooseMode::Chat
+        || !request_was_advertised(messages, request)
+        || pursue_done_called_with_other_tools(messages, request))
 }
 
 pub(super) fn request_was_advertised(messages: &[Message], request: &ToolRequest) -> bool {
