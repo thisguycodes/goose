@@ -1,0 +1,100 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Hourly, off the top of the hour.
+    - cron: "47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+# main is upstream/main plus one --no-ff merge per fork feature branch.
+# Each sync rebases every feature branch (conflicts are resolved there,
+# permanently, in the commits) and re-creates the merge bubbles (always
+# trivial, since each branch is ahead of its merge base). sync-base marks
+# the upstream commit the last build was based on.
+jobs:
+  sync:
+    # Only run in the fork; scheduled runs happen on the default branch.
+    if: github.repository == 'thisguycodes/goose'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the rebuilt main and rebased feature branches
+    env:
+      UPSTREAM_URL: https://github.com/aaif-goose/goose.git
+      BRANCHES: feature/analyze-languages ci/fork-workflows feature/pursue ci/upstream-sync ci/fork-cache-and-pages fix/pursue-lifecycle fix/summon-delegate-keys
+    steps:
+      - name: Check out main # zizmor: ignore[artipacked] credentials are needed to push main and the feature branches
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # Optional fine-grained PAT (Contents: RW on this fork). Pushes made
+          # with GITHUB_TOKEN do not trigger CI on main; with SYNC_TOKEN they do.
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Rebase feature branches onto upstream/main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+
+          tip=$(git rev-parse upstream/main)
+          prev_old=$(git rev-parse origin/sync-base)
+          old_main=$(git rev-parse origin/main)
+
+          for b in $BRANCHES; do # shellcheck disable=SC2086
+            old_tip=$(git rev-parse "origin/$b")
+            git branch -f "$b" "$old_tip"
+            # Replay only this branch's own commits. Commits upstream has
+            # since merged become empty and are dropped. Fixed committer
+            # dates keep rebuilds bit-identical when nothing changed, so
+            # idle runs push nothing.
+            if ! git rebase --empty=drop --committer-date-is-author-date --onto "$tip" "$prev_old" "$b"; then
+              git rebase --abort
+              echo "::error::$b conflicts with upstream. Fix locally: git rebase --onto upstream/main <prev-branch-tip> $b, force-push, re-run."
+              exit 1
+            fi
+            git checkout -q -B main "$tip"
+            GIT_AUTHOR_DATE=$(git log -1 --format=%cd "$b") GIT_COMMITTER_DATE=$(git log -1 --format=%cd "$b") git merge --no-ff -m "Merge branch '$b'" "$b"
+            prev_old=$old_tip
+            tip=$(git rev-parse main)
+          done
+
+          # Absorb anything pushed directly to main since the last build.
+          if [ "$old_main" != "$prev_old" ]; then
+            git branch -f main-direct "$old_main"
+            if ! git rebase --empty=drop --committer-date-is-author-date --onto "$tip" "$prev_old" main-direct; then
+              git rebase --abort
+              echo "::error::Commits on main outside the feature branches conflict with upstream; resolve manually."
+              exit 1
+            fi
+            git checkout -q -B main main-direct
+            echo "::warning::main had commits outside the feature branches; absorbed linearly. Route work through a feature branch for a merge bubble."
+          fi
+
+          {
+            echo "### Synced onto upstream $(git rev-parse --short upstream/main)"
+            git log --oneline --first-parent "origin/sync-base..main" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push rebuilt refs
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse main)" = "$(git rev-parse origin/main)" ]; then
+            echo "Already up to date."
+            exit 0
+          fi
+          for b in $BRANCHES; do # shellcheck disable=SC2086
+            git push --force-with-lease="$b:$(git rev-parse origin/$b)" origin "$b"
+          done
+          git push --force-with-lease="sync-base:$(git rev-parse origin/sync-base)" origin upstream/main:refs/heads/sync-base
+          git push --force-with-lease="main:$(git rev-parse origin/main)" origin main
