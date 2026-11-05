@@ -114,6 +114,8 @@ jobs:
       signing: false
 
   bundle-windows-cuda:
+    # Disabled on this fork: no Windows/CUDA hardware
+    if: false
     needs: [prepare-version]
     uses: ./.github/workflows/bundle-windows.yml
     permissions:
@@ -132,7 +134,7 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [build-acp, build-cli-linux, install-script, bundle-macos-arm64, bundle-macos-x64, bundle-windows, bundle-windows-cuda]
+    needs: [build-acp, build-cli-linux, install-script, bundle-macos-arm64, bundle-macos-x64, bundle-windows]
     permissions:
       contents: write
       id-token: write      # Required for Sigstore OIDC signing
