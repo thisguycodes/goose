@@ -108,6 +108,7 @@ default = [
     "chat-recall",
     "acp-http",
     "online-model-meta",
+    "roaming",
 ]
 online-model-meta = ["goose/online-model-meta"]
 roaming = ["dep:goose-roaming", "dep:qrcode", "dep:fs2", "dep:agent-client-protocol"]
