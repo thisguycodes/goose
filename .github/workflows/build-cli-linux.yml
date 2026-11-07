@@ -132,6 +132,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
+          cache-on-failure: false
           target: ${{ matrix.architecture }}-${{ matrix.target-suffix }}
           cache-key: ${{ matrix.architecture }}-${{ matrix.target-suffix }}-${{ matrix.build-on }}-${{ matrix.container || 'native' }}
 
