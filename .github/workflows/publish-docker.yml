@@ -15,7 +15,7 @@ on:
 permissions:
   contents: read
 
-# Every main push/tag must publish its own image, so never cancel in-flight runs
+# Serialize each ref and keep only the newest pending run for rapid main pushes
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
