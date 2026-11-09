@@ -53,6 +53,9 @@ pub struct ModelConfig {
     pub reasoning: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// Opt in only when both the provider and model support assistant prefill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_assistant_prefill: Option<bool>,
     /// Per-request HTTP headers attached to outgoing provider calls.
     /// Never serialized into request bodies.
     #[serde(skip)]
@@ -79,6 +82,8 @@ impl<'de> Deserialize<'de> for ModelConfig {
             reasoning: Option<bool>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             supports_vision: Option<bool>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            supports_assistant_prefill: Option<bool>,
         }
 
         let raw = RawModelConfig::deserialize(deserializer)?;
@@ -92,6 +97,7 @@ impl<'de> Deserialize<'de> for ModelConfig {
             request_params: raw.request_params,
             reasoning: raw.reasoning,
             supports_vision: raw.supports_vision,
+            supports_assistant_prefill: raw.supports_assistant_prefill,
             request_headers: None,
         };
         config.normalize_effort_suffix();
@@ -111,6 +117,7 @@ impl ModelConfig {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
         config.normalize_effort_suffix();
@@ -255,6 +262,11 @@ impl ModelConfig {
 
     pub fn with_vision_support(mut self, supports_vision: bool) -> Self {
         self.supports_vision = Some(supports_vision);
+        self
+    }
+
+    pub fn with_assistant_prefill_support(mut self, supports_assistant_prefill: bool) -> Self {
+        self.supports_assistant_prefill = Some(supports_assistant_prefill);
         self
     }
 

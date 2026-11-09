@@ -1287,6 +1287,19 @@ fn parse_streaming_chunk(line: &str) -> Result<Option<StreamingChunk>, ProviderE
     })
 }
 
+fn rate_limit_after_non_text(error: ProviderError) -> ProviderError {
+    match error {
+        ProviderError::RateLimitExceeded {
+            details,
+            retry_delay,
+        } => ProviderError::RateLimitExceededAfterNonText {
+            details,
+            retry_delay,
+        },
+        error => error,
+    }
+}
+
 fn output_token_limit_marker(id: Option<String>) -> Message {
     let mut message = Message::assistant();
     if let Some(id) = id {
@@ -1321,9 +1334,34 @@ where
         let mut output_token_limit_reached = false;
         let mut output_token_limit_metadata_emitted = false;
         let mut usage_emitted = false;
+        let mut pending_usage: Option<ProviderUsage> = None;
 
         'outer: while let Some(response) = stream.next().await {
-            let response_str = response?;
+            let response_str = match response
+                .map_err(ProviderError::from_stream_error)
+                .map_err(|error| {
+                    if pending_inline_thinking.is_empty()
+                        && !think_filter.has_pending_state()
+                        && accumulated_reasoning.is_empty()
+                    {
+                        error
+                    } else {
+                        rate_limit_after_non_text(error)
+                    }
+                }) {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(usage) = pending_usage.take() {
+                        usage_emitted = true;
+                        yield (None, Some(usage));
+                    }
+                    if output_token_limit_reached && !output_token_limit_metadata_emitted {
+                        output_token_limit_metadata_emitted = true;
+                        yield (Some(output_token_limit_marker(last_response_id.clone())), None);
+                    }
+                    Err(error)?
+                }
+            };
             let line = strip_data_prefix(&response_str);
 
             if line.is_some_and(|l| l == "[DONE]") {
@@ -1334,9 +1372,33 @@ where
                 continue
             }
 
-            let Some(chunk) = parse_streaming_chunk(
+            let chunk = match parse_streaming_chunk(
                 line.ok_or_else(|| anyhow!("unexpected stream format"))?
-            )? else {
+            )
+            .map_err(|error| {
+                if pending_inline_thinking.is_empty()
+                    && !think_filter.has_pending_state()
+                    && accumulated_reasoning.is_empty()
+                {
+                    error
+                } else {
+                    rate_limit_after_non_text(error)
+                }
+            }) {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    if let Some(usage) = pending_usage.take() {
+                        usage_emitted = true;
+                        yield (None, Some(usage));
+                    }
+                    if output_token_limit_reached && !output_token_limit_metadata_emitted {
+                        output_token_limit_metadata_emitted = true;
+                        yield (Some(output_token_limit_marker(last_response_id.clone())), None);
+                    }
+                    Err(error)?
+                }
+            };
+            let Some(chunk) = chunk else {
                 continue  // metadata-only frame
             };
             if let Some(model) = &chunk.model {
@@ -1372,9 +1434,15 @@ where
                 }
             }
             output_token_limit_reached |= last_finish_reason.as_deref() == Some("length");
+            if usage.is_some() {
+                pending_usage = usage.clone();
+            }
 
             if chunk.choices.is_empty() {
                 usage_emitted |= usage.is_some();
+                if usage.is_some() {
+                    pending_usage = None;
+                }
                 yield (None, usage)
             } else if chunk.choices[0].delta.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()) {
                 let mut tool_call_data: ToolCallData = HashMap::new();
@@ -1397,7 +1465,19 @@ where
                     let mut done = false;
                     while !done {
                         if let Some(response_chunk) = stream.next().await {
-                            let response_str = response_chunk?;
+                            let response_str = match response_chunk
+                                .map_err(ProviderError::from_stream_error)
+                                .map_err(rate_limit_after_non_text)
+                            {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    if let Some(usage) = pending_usage.take() {
+                                        usage_emitted = true;
+                                        yield (None, Some(usage));
+                                    }
+                                    Err(error)?
+                                }
+                            };
                             if let Some(line) = strip_data_prefix(&response_str) {
                                 if line == "[DONE]" {
                                     break 'outer;
@@ -1406,7 +1486,19 @@ where
                                 // A metadata frame here must NOT fall through to the
                                 // empty-choices branch below, which ends accumulation and
                                 // would truncate this tool call's arguments.
-                                let Some(tool_chunk) = parse_streaming_chunk(line)? else {
+                                let tool_chunk = match parse_streaming_chunk(line)
+                                    .map_err(rate_limit_after_non_text)
+                                {
+                                    Ok(chunk) => chunk,
+                                    Err(error) => {
+                                        if let Some(usage) = pending_usage.take() {
+                                            usage_emitted = true;
+                                            yield (None, Some(usage));
+                                        }
+                                        Err(error)?
+                                    }
+                                };
+                                let Some(tool_chunk) = tool_chunk else {
                                     continue
                                 };
                                 if let Some(model) = &tool_chunk.model {
@@ -1426,6 +1518,7 @@ where
                                     if let Some(id) = &last_response_id {
                                         chunk_usage.response_id = Some(id.clone());
                                     }
+                                    pending_usage = Some(chunk_usage.clone());
                                     usage = Some(chunk_usage);
                                 }
 
@@ -1617,6 +1710,9 @@ where
                 output_token_limit_metadata_emitted |= output_token_limit_reached;
 
                 usage_emitted |= usage.is_some();
+                if usage.is_some() {
+                    pending_usage = None;
+                }
                 yield (
                     Some(msg),
                     usage,
@@ -1665,13 +1761,18 @@ where
                         None
                     };
                     usage_emitted |= final_usage.is_some();
+                    if final_usage.is_some() {
+                        pending_usage = None;
+                    }
                     yield (Some(msg), final_usage)
                 } else if usage.is_some() {
                     usage_emitted = true;
+                    pending_usage = None;
                     yield (None, usage)
                 }
             } else if usage.is_some() {
                 usage_emitted = true;
+                pending_usage = None;
                 yield (None, usage)
             }
         }
@@ -1712,6 +1813,11 @@ where
 
         if output_token_limit_reached && !output_token_limit_metadata_emitted {
             yield (Some(output_token_limit_marker(last_response_id.clone())), None)
+        }
+
+        if let Some(usage) = pending_usage.take() {
+            usage_emitted = true;
+            yield (None, Some(usage));
         }
 
         if !usage_emitted && (last_response_id.is_some() || last_finish_reason.is_some()) {
@@ -3390,6 +3496,7 @@ mod tests {
             ("max_tokens".to_string(), json!(1)),
             ("temperature".to_string(), json!(2.0)),
             ("provider_custom".to_string(), json!("allowed")),
+            ("add_generation_prompt".to_string(), json!(false)),
             ("thinking_effort".to_string(), json!("high")),
             ("disable_prompt_cache".to_string(), json!(true)),
             ("preserve_thinking_context".to_string(), json!(true)),
@@ -3421,6 +3528,7 @@ mod tests {
         assert_eq!(request["max_tokens"], 1);
         assert_eq!(request["temperature"], 2.0);
         assert_eq!(request["provider_custom"], "allowed");
+        assert_eq!(request["add_generation_prompt"], false);
         assert!(request.get("thinking_effort").is_none());
         assert!(request.get("disable_prompt_cache").is_none());
         assert!(request.get("preserve_thinking_context").is_none());
@@ -5245,6 +5353,47 @@ data: [DONE]"#;
         }
     }
 
+    #[tokio::test]
+    async fn test_streaming_usage_is_emitted_before_rate_limit_error() {
+        let chunks = vec![
+            Ok(format!(
+                "data: {}",
+                json!({
+                    "id": "chatcmpl-usage",
+                    "model": "test-model",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "partial"},
+                        "finish_reason": null
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+                })
+            )),
+            Ok(format!(
+                "data: {}",
+                json!({"error": {"message": "rate limited", "type": "rate_limit_error"}})
+            )),
+        ];
+        let stream = response_to_streaming_message(tokio_stream::iter(chunks));
+        futures::pin_mut!(stream);
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.0.unwrap().as_concat_text(), "partial");
+        assert!(first.1.is_none());
+
+        let pending = stream.next().await.unwrap().unwrap();
+        assert!(pending.0.is_none());
+        let usage = pending.1.unwrap();
+        assert_eq!(usage.usage.input_tokens, Some(10));
+        assert_eq!(usage.usage.output_tokens, Some(2));
+
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ProviderError>(),
+            Some(ProviderError::RateLimitExceeded { .. })
+        ));
+    }
+
     #[test]
     fn test_rate_limit_error_frames_preserve_error_kind() {
         for line in [
@@ -5325,6 +5474,29 @@ data: [DONE]"#;
             err.to_string().contains("rate limited"),
             "the gateway's message must reach the caller: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn reasoning_details_block_text_prefill_recovery() {
+        let response_lines = concat!(
+            r#"data: {"id":"x","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"1 2 ","reasoning_details":[{"type":"reasoning.text","text":"hidden"}]}}]}"#,
+            "\n",
+            r#"data: {"error":{"message":"rate limited","type":"rate_limit_error"}}"#
+        );
+        let lines: Vec<String> = response_lines
+            .lines()
+            .map(|line| line.to_string())
+            .collect();
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let mut messages = std::pin::pin!(response_to_streaming_message(response_stream));
+
+        let first = messages.next().await.unwrap().unwrap();
+        assert_eq!(first.0.unwrap().as_concat_text(), "1 2 ");
+        let error = messages.next().await.unwrap().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ProviderError>(),
+            Some(ProviderError::RateLimitExceededAfterNonText { .. })
+        ));
     }
 
     #[test]

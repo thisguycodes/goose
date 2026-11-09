@@ -88,6 +88,10 @@ impl From<goose_providers::errors::ProviderError> for GooseError {
             goose_providers::errors::ProviderError::RateLimitExceeded {
                 details,
                 retry_delay,
+            }
+            | goose_providers::errors::ProviderError::RateLimitExceededAfterNonText {
+                details,
+                retry_delay,
             } => {
                 let retry_after_ms = retry_delay.map(|delay| delay.as_millis() as u64);
                 let retry_after_suffix = format!(

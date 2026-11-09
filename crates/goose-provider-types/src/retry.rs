@@ -163,6 +163,7 @@ fn is_permanent_request_failure(message: &str) -> bool {
 pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
     match error {
         ProviderError::RateLimitExceeded { .. }
+        | ProviderError::RateLimitExceededAfterNonText { .. }
         | ProviderError::ServerError(_)
         | ProviderError::NetworkError(_) => true,
         ProviderError::RequestFailed(message) if is_permanent_request_failure(message) => false,
@@ -176,11 +177,15 @@ pub async fn sleep_before_retry(error: &ProviderError, config: &RetryConfig, att
         ProviderError::RateLimitExceeded {
             retry_delay: Some(delay),
             ..
+        }
+        | ProviderError::RateLimitExceededAfterNonText {
+            retry_delay: Some(delay),
+            ..
         } => *delay,
         _ => config.delay_for_attempt(attempt),
     };
 
-    if matches!(error, ProviderError::RateLimitExceeded { .. }) {
+    if error.is_rate_limit_exceeded() {
         sleep_for_rate_limit(
             RateLimitWaitKind::Retry {
                 attempt,

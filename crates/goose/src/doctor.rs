@@ -272,7 +272,8 @@ fn describe_error(e: &ProviderError) -> String {
             }
             msg
         }
-        ProviderError::RateLimitExceeded { .. } => {
+        ProviderError::RateLimitExceeded { .. }
+        | ProviderError::RateLimitExceededAfterNonText { .. } => {
             "Rate limited — wait a moment and try again.".to_string()
         }
         ProviderError::EndpointNotFound(_) => {

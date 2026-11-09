@@ -314,6 +314,9 @@ pub fn update_custom_provider(params: UpdateCustomProviderParams) -> Result<()> 
                         .supports_cache_control
                         .or(existing.supports_cache_control);
                     model.supports_vision = model.supports_vision.or(existing.supports_vision);
+                    model.supports_assistant_prefill = model
+                        .supports_assistant_prefill
+                        .or(existing.supports_assistant_prefill);
                     model.reasoning |= existing.reasoning;
                     model.thinking_preservation_format = model
                         .thinking_preservation_format
@@ -621,6 +624,7 @@ mod tests {
                 supports_cache_control: None,
                 reasoning: false,
                 supports_vision: None,
+                supports_assistant_prefill: None,
                 thinking_preservation_format: None,
                 request_params: None,
             }],

@@ -1909,6 +1909,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2145,6 +2146,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2190,6 +2192,7 @@ mod tests {
                 request_params: None,
                 reasoning: None,
                 supports_vision: None,
+                supports_assistant_prefill: None,
                 request_headers: None,
             };
 
@@ -2319,6 +2322,7 @@ mod tests {
                 request_params: None,
                 reasoning: None,
                 supports_vision: None,
+                supports_assistant_prefill: None,
                 request_headers: None,
             };
 
@@ -2503,6 +2507,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2530,6 +2535,7 @@ mod tests {
             )])),
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2556,6 +2562,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: Some(true),
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2606,6 +2613,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: Some(true),
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2644,6 +2652,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2677,6 +2686,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2709,6 +2719,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2744,6 +2755,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2784,6 +2796,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2811,6 +2824,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: Some(true),
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2844,6 +2858,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: Some(true),
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -2939,6 +2954,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -3380,6 +3396,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -3413,6 +3430,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 
@@ -3446,6 +3464,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 

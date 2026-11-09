@@ -1,13 +1,14 @@
 use anyhow::Result;
 use goose_providers::errors::ProviderError;
 use regex::Regex;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_stream::try_stream;
 use futures::stream::StreamExt;
 use serde_json::{json, Value};
 use tracing::debug;
 
+use super::assistant_stream::AssistantStreamState;
 use super::gen_ai_telemetry;
 use crate::config::Config;
 use crate::conversation::message::{Message, MessageContent};
@@ -166,19 +167,6 @@ fn message_has_timing_content(message: &Message) -> bool {
         .content
         .iter()
         .any(|content| !matches!(content, MessageContent::SystemNotification(_)))
-}
-
-fn is_mergeable_assistant_chunk(message: &Message) -> bool {
-    message.role == rmcp::model::Role::Assistant
-        && !message.content.is_empty()
-        && message.content.iter().all(|content| {
-            matches!(
-                content,
-                MessageContent::Text(_)
-                    | MessageContent::Thinking(_)
-                    | MessageContent::RedactedThinking(_)
-            )
-        })
 }
 
 pub(crate) fn prepare_inference_tools(
@@ -341,8 +329,12 @@ pub(crate) async fn stream_response_from_provider(
                             "Provider stream failed before its first item, retrying ({}/{}): {:?}",
                             attempts, retry_config.max_retries, error
                         );
-                        goose_providers::retry::sleep_before_retry(&error, &retry_config, attempts)
-                            .await;
+                        goose_providers::retry::sleep_before_retry(
+                            &error,
+                            &retry_config,
+                            attempts,
+                        )
+                        .await;
 
                         stream = match crate::session_context::with_session_id(
                             Some(session_id.clone()),
@@ -431,20 +423,83 @@ pub(crate) async fn stream_response_from_provider(
                 yield (None, final_usage);
             }
         } else {
+            let retry_config = provider.retry_config().transient_only();
+            let mut assistant_stream = AssistantStreamState::new(
+                model_config.supports_assistant_prefill.unwrap_or(false),
+            );
             let mut first_content_at: Option<std::time::Instant> = None;
-            let mut active_mergeable_assistant_id: Option<String> = None;
+            let mut pending_usage: Option<ProviderUsage> = None;
             let mut output_message: Option<Message> = None;
             while let Some(result) = stream.next().await {
-                let (message, mut usage) = result?;
+                let (message, usage) = match result {
+                    Ok(item) => item,
+                    Err(error)
+                        if assistant_stream.can_continue_after_rate_limit(
+                            &error,
+                            provider.manages_own_context(),
+                            retry_config.max_retries,
+                        ) =>
+                    {
+                        if let Some(usage) = pending_usage.take() {
+                            yield (None, Some(usage));
+                        }
+                        let (prefill_attempt, prefill_prefix) =
+                            assistant_stream.begin_continuation();
+                        warn!(
+                            "Provider stream hit a rate limit after partial text; continuing with assistant prefill ({}/{}): {:?}",
+                            prefill_attempt, retry_config.max_retries, error
+                        );
+                        goose_providers::retry::sleep_before_retry(
+                            &error,
+                            &retry_config,
+                            prefill_attempt,
+                        )
+                        .await;
+
+                        let mut continuation_messages = messages_for_provider.messages().to_vec();
+                        continuation_messages.push(Message::assistant().with_text(&prefill_prefix));
+                        let continuation_config = model_config.clone().with_merged_request_params(
+                            HashMap::from([(
+                                "add_generation_prompt".to_string(),
+                                serde_json::Value::Bool(false),
+                            )]),
+                        );
+                        stream = match crate::session_context::with_session_id(
+                            Some(session_id.clone()),
+                            provider.stream(
+                                &continuation_config,
+                                system_prompt.as_str(),
+                                &continuation_messages,
+                                &tools,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                Err(enhance_model_error(error, &provider, config.toolshim).await)?
+                            }
+                        };
+                        continue;
+                    }
+                    Err(error) => {
+                        if let Some(usage) = pending_usage.take() {
+                            yield (None, Some(usage));
+                        }
+                        Err(error)?;
+                        unreachable!()
+                    }
+                };
 
                 if first_content_at.is_none()
                     && message.as_ref().is_some_and(message_has_timing_content)
                 {
                     first_content_at = Some(std::time::Instant::now());
                 }
-                if let Some(usage) = usage.as_mut() {
-                    fill_stream_timing(usage, request_started, first_content_at);
-                    gen_ai_telemetry::record_provider_usage(&span, usage);
+                if let Some(mut usage) = usage {
+                    fill_stream_timing(&mut usage, request_started, first_content_at);
+                    gen_ai_telemetry::record_provider_usage(&span, &usage);
+                    pending_usage = Some(usage);
                 }
                 if capture_message_content {
                     if let Some(message) = message.as_ref() {
@@ -452,22 +507,11 @@ pub(crate) async fn stream_response_from_provider(
                     }
                 }
 
-                let message = message.map(|message| {
-                    if message.id.is_some() {
-                        active_mergeable_assistant_id = None;
-                        message
-                    } else if is_mergeable_assistant_chunk(&message) {
-                        let id = active_mergeable_assistant_id
-                            .get_or_insert_with(|| format!("msg_{}", uuid::Uuid::new_v4()))
-                            .clone();
-                        message.with_id(id)
-                    } else {
-                        active_mergeable_assistant_id = None;
-                        message.with_generated_id()
-                    }
-                });
-
-                yield (message, usage);
+                let message = message.map(|message| assistant_stream.process_message(message));
+                yield (message, None);
+            }
+            if let Some(usage) = pending_usage.take() {
+                yield (None, Some(usage));
             }
             if let Some(output_message) = output_message {
                 let output_messages = gen_ai_telemetry::output_message_json(&output_message);
@@ -526,7 +570,9 @@ mod tests {
     use crate::conversation::message::{Message, SystemNotificationType};
     use crate::providers::base::Provider;
     use async_trait::async_trait;
-    use goose_providers::conversation::token_usage::{ProviderStats, ProviderUsage, Usage};
+    use goose_providers::conversation::token_usage::{
+        CostSource, ProviderStats, ProviderUsage, Usage,
+    };
     use goose_providers::model::ModelConfig;
     use rmcp::model::{Annotations, Role, TextContent};
     use rmcp::object;
@@ -558,6 +604,547 @@ mod tests {
                 Ok((Some(Message::assistant().with_text("world")), Some(usage))),
             ])))
         }
+    }
+
+    type RecordedProviderCalls = Arc<Mutex<Vec<(ModelConfig, Vec<Message>)>>>;
+
+    #[derive(Clone, Default)]
+    struct PrefillRetryProvider {
+        calls: RecordedProviderCalls,
+        continuation: Option<Message>,
+        include_usage: bool,
+    }
+
+    #[async_trait]
+    impl Provider for PrefillRetryProvider {
+        fn get_name(&self) -> &str {
+            "prefill-retry"
+        }
+
+        async fn stream(
+            &self,
+            model_config: &ModelConfig,
+            _system: &str,
+            messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            type StreamItem = Result<(Option<Message>, Option<ProviderUsage>), ProviderError>;
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((model_config.clone(), messages.to_vec()));
+            let call = calls.len();
+            drop(calls);
+
+            let stale_usage = self.include_usage.then(|| {
+                ProviderUsage::new(
+                    "test-model".to_string(),
+                    Usage::new(Some(9), Some(1), Some(10)),
+                )
+                .with_cost(0.5, CostSource::ProviderReported)
+            });
+            let first_usage = self.include_usage.then(|| {
+                ProviderUsage::new(
+                    "test-model".to_string(),
+                    Usage::new(Some(10), Some(2), Some(12)),
+                )
+                .with_cost(1.0, CostSource::ProviderReported)
+            });
+            let continuation_usage = self.include_usage.then(|| {
+                ProviderUsage::new(
+                    "test-model".to_string(),
+                    Usage::new(Some(20), Some(3), Some(23)),
+                )
+                .with_cost(2.0, CostSource::ProviderReported)
+            });
+            let items: Vec<StreamItem> = match call {
+                1 if self.include_usage => vec![
+                    Ok((Some(Message::assistant().with_text("1 2 ")), stale_usage)),
+                    Ok((None, first_usage)),
+                    Err(ProviderError::RateLimitExceeded {
+                        details: "test rate limit".to_string(),
+                        retry_delay: Some(Duration::ZERO),
+                    }),
+                ],
+                1 => vec![
+                    Ok((Some(Message::assistant().with_text("1 2 ")), None)),
+                    Err(ProviderError::RateLimitExceeded {
+                        details: "test rate limit".to_string(),
+                        retry_delay: Some(Duration::ZERO),
+                    }),
+                ],
+                2 => vec![Ok((
+                    Some(
+                        self.continuation
+                            .clone()
+                            .unwrap_or_else(|| Message::assistant().with_text("3")),
+                    ),
+                    continuation_usage,
+                ))],
+                _ => panic!("unexpected provider call {call}"),
+            };
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limited_partial_text_uses_assistant_prefill() -> anyhow::Result<()> {
+        let provider = Arc::new(PrefillRetryProvider::default());
+        let mut stream = stream_response_from_provider(
+            provider.clone(),
+            ModelConfig::new("test-model").with_assistant_prefill_support(true),
+            "test-session",
+            "system",
+            &[Message::user().with_text("count")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let mut messages = Vec::new();
+        while let Some(item) = stream.next().await {
+            let (message, _) = item?;
+            if let Some(message) = message {
+                messages.push(message);
+            }
+        }
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].as_concat_text(), "1 2 ");
+        assert_eq!(messages[1].as_concat_text(), "3");
+        assert_eq!(messages[0].id, messages[1].id);
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0]
+            .0
+            .request_params
+            .as_ref()
+            .is_none_or(|params| !params.contains_key("add_generation_prompt")));
+        assert_eq!(
+            calls[1]
+                .0
+                .request_params
+                .as_ref()
+                .and_then(|params| params.get("add_generation_prompt")),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(calls[1].1.len(), 2);
+        assert_eq!(calls[1].1[0].as_concat_text(), "count");
+        assert_eq!(calls[1].1[1].role, Role::Assistant);
+        assert_eq!(calls[1].1[1].as_concat_text(), "1 2 ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prefill_recovery_preserves_per_attempt_usage() -> anyhow::Result<()> {
+        let provider = Arc::new(PrefillRetryProvider {
+            include_usage: true,
+            ..PrefillRetryProvider::default()
+        });
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model").with_assistant_prefill_support(true),
+            "test-session",
+            "system",
+            &[Message::user().with_text("count")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let mut usages = Vec::new();
+        while let Some(item) = stream.next().await {
+            let (_, usage) = item?;
+            if let Some(usage) = usage {
+                usages.push(usage);
+            }
+        }
+
+        assert_eq!(usages.len(), 2);
+        assert_eq!(usages[0].usage.input_tokens, Some(10));
+        assert_eq!(usages[0].usage.output_tokens, Some(2));
+        assert_eq!(usages[0].cost, Some(1.0));
+        assert_eq!(usages[1].usage.input_tokens, Some(20));
+        assert_eq!(usages[1].usage.output_tokens, Some(3));
+        assert_eq!(usages[1].cost, Some(2.0));
+        assert!(usages
+            .iter()
+            .all(|usage| usage.cost_source == Some(CostSource::ProviderReported)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prefill_continuation_thinking_does_not_reuse_text_message_id() -> anyhow::Result<()> {
+        let thinking = Message::assistant().with_content(MessageContent::Thinking(
+            goose_providers::conversation::message::ThinkingContentBlock {
+                thinking: "replacement reasoning".to_string(),
+                signature: String::new(),
+            },
+        ));
+        let provider = Arc::new(PrefillRetryProvider {
+            continuation: Some(thinking),
+            ..PrefillRetryProvider::default()
+        });
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model").with_assistant_prefill_support(true),
+            "test-session",
+            "system",
+            &[Message::user().with_text("count")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let first = stream.next().await.unwrap()?.0.unwrap();
+        let second = stream.next().await.unwrap()?.0.unwrap();
+        assert_eq!(first.as_concat_text(), "1 2 ");
+        assert_ne!(first.id, second.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prefill_provider_thinking_id_clears_resume_for_following_text() -> anyhow::Result<()> {
+        let thinking = Message::assistant()
+            .with_id("provider-thinking")
+            .with_content(MessageContent::Thinking(
+                goose_providers::conversation::message::ThinkingContentBlock {
+                    thinking: "replacement reasoning".to_string(),
+                    signature: String::new(),
+                },
+            ));
+        let provider = Arc::new(SequencedProvider::new(vec![
+            Ok(vec![
+                Ok((Some(Message::assistant().with_text("1 2 ")), None)),
+                Err(ProviderError::RateLimitExceeded {
+                    details: "test rate limit".to_string(),
+                    retry_delay: Some(Duration::ZERO),
+                }),
+            ]),
+            Ok(vec![
+                Ok((Some(thinking), None)),
+                Ok((Some(Message::assistant().with_text("3")), None)),
+            ]),
+        ]));
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model").with_assistant_prefill_support(true),
+            "test-session",
+            "system",
+            &[Message::user().with_text("count")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let mut messages = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let Some(message) = item?.0 {
+                messages.push(message);
+            }
+        }
+
+        assert_eq!(messages.len(), 3);
+        assert_ne!(messages[1].id, messages[0].id);
+        assert_ne!(messages[2].id, messages[0].id);
+        assert_ne!(messages[2].id, messages[1].id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_text_rate_limit_remains_an_error_without_prefill_support() {
+        let provider = Arc::new(PrefillRetryProvider::default());
+        let mut stream = stream_response_from_provider(
+            provider.clone(),
+            ModelConfig::new("test-model"),
+            "test-session",
+            "system",
+            &[Message::user().with_text("count")],
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.0.unwrap().as_concat_text(), "1 2 ");
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(ProviderError::RateLimitExceeded { .. })
+        ));
+        assert_eq!(provider.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn openai_rate_limit_frame_retries_with_wire_level_prefill() -> anyhow::Result<()> {
+        use crate::providers::api_client::{ApiClient, AuthMethod};
+        use crate::providers::openai::OpenAiProviderBuilder;
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let responder_count = request_count.clone();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |_request: &Request| {
+                let request_number = responder_count.fetch_add(1, Ordering::SeqCst);
+                let body = if request_number == 0 {
+                    format!(
+                        "data: {}\n\ndata: {}\n\n",
+                        json!({
+                            "id": "first", "model": "test-model",
+                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "1 2 "}}]
+                        }),
+                        json!({"error": {"message": "rate limited", "type": "rate_limit_error", "code": 429}})
+                    )
+                } else {
+                    format!(
+                        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                        json!({
+                            "id": "second", "model": "test-model",
+                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "3"}}]
+                        }),
+                        json!({
+                            "id": "second", "model": "test-model",
+                            "choices": [{"index": 0, "delta": {"content": " 4"}}]
+                        })
+                    )
+                };
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body)
+            })
+            .mount(&server)
+            .await;
+
+        let api_client = ApiClient::new_with_tls(server.uri(), AuthMethod::NoAuth, None)?;
+        let provider = Arc::new(OpenAiProviderBuilder::new(api_client).build());
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model").with_assistant_prefill_support(true),
+            "test-session",
+            "system",
+            &[Message::user().with_text("count")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let mut messages = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let Some(message) = item?.0 {
+                messages.push(message);
+            }
+        }
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].as_concat_text(), "1 2 ");
+        assert_eq!(messages[1].as_concat_text(), "3");
+        assert_eq!(messages[2].as_concat_text(), " 4");
+        assert!(
+            messages.iter().all(|message| message.id == messages[0].id),
+            "{messages:#?}"
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let first: serde_json::Value = requests[0].body_json()?;
+        let second: serde_json::Value = requests[1].body_json()?;
+        assert!(first.get("add_generation_prompt").is_none());
+        assert_eq!(second["add_generation_prompt"], false);
+        let wire_messages = second["messages"].as_array().unwrap();
+        assert_eq!(wire_messages.last().unwrap()["role"], "assistant");
+        assert_eq!(wire_messages.last().unwrap()["content"], "1 2 ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_rate_limit_during_tool_call_does_not_use_prefill() -> anyhow::Result<()> {
+        use crate::providers::api_client::{ApiClient, AuthMethod};
+        use crate::providers::openai::OpenAiProviderBuilder;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            json!({
+                "id": "first", "model": "test-model",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "1 2 "}}]
+            }),
+            json!({
+                "id": "first", "model": "test-model",
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":"}
+                }]}}]
+            }),
+            json!({
+                "type": "error",
+                "error": {"message": "rate limited", "type": "rate_limit_error"}
+            })
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let api_client = ApiClient::new_with_tls(server.uri(), AuthMethod::NoAuth, None)?;
+        let provider = Arc::new(OpenAiProviderBuilder::new(api_client).build());
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model").with_assistant_prefill_support(true),
+            "test-session",
+            "system",
+            &[Message::user().with_text("count")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let first = stream.next().await.unwrap()?.0.unwrap();
+        assert_eq!(first.as_concat_text(), "1 2 ");
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderError::RateLimitExceededAfterNonText { .. }
+        ));
+        assert!(stream.next().await.is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_rate_limit_during_inline_thinking_does_not_use_prefill() -> anyhow::Result<()> {
+        use crate::providers::api_client::{ApiClient, AuthMethod};
+        use crate::providers::openai::OpenAiProviderBuilder;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({
+                "id": "first", "model": "test-model",
+                "choices": [{"index": 0, "delta": {
+                    "role": "assistant",
+                    "content": "1 2 <think>"
+                }}]
+            }),
+            json!({
+                "type": "error",
+                "error": {"message": "rate limited", "type": "rate_limit_error"}
+            })
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let api_client = ApiClient::new_with_tls(server.uri(), AuthMethod::NoAuth, None)?;
+        let provider = Arc::new(OpenAiProviderBuilder::new(api_client).build());
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model").with_assistant_prefill_support(true),
+            "test-session",
+            "system",
+            &[Message::user().with_text("count")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let first = stream.next().await.unwrap()?.0.unwrap();
+        assert_eq!(first.as_concat_text(), "1 2 ");
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderError::RateLimitExceededAfterNonText { .. }
+        ));
+        assert!(stream.next().await.is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_rate_limit_after_length_finish_does_not_use_prefill() -> anyhow::Result<()> {
+        use crate::providers::api_client::{ApiClient, AuthMethod};
+        use crate::providers::openai::OpenAiProviderBuilder;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            json!({
+                "id": "first", "model": "test-model",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "1 2 "}}]
+            }),
+            json!({
+                "id": "first", "model": "test-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+            }),
+            json!({
+                "type": "error",
+                "error": {"message": "rate limited", "type": "rate_limit_error"}
+            })
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let api_client = ApiClient::new_with_tls(server.uri(), AuthMethod::NoAuth, None)?;
+        let provider = Arc::new(OpenAiProviderBuilder::new(api_client).build());
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model").with_assistant_prefill_support(true),
+            "test-session",
+            "system",
+            &[Message::user().with_text("count")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let mut saw_token_limit = false;
+        let error = loop {
+            match stream.next().await.unwrap() {
+                Ok((message, _)) => {
+                    if message.is_some_and(|message| message.metadata.output_token_limit_reached) {
+                        saw_token_limit = true;
+                    }
+                }
+                Err(error) => break error,
+            }
+        };
+        assert!(saw_token_limit);
+        assert!(matches!(error, ProviderError::RateLimitExceeded { .. }));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        Ok(())
     }
 
     #[derive(Clone)]
@@ -928,6 +1515,56 @@ mod tests {
         assert_ne!(ids[8], ids[5]);
         assert_ne!(ids[8], ids[7]);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn normal_thinking_chunks_get_independent_message_ids() -> anyhow::Result<()> {
+        let thinking = |text: &str| {
+            Ok((
+                Some(Message::assistant().with_content(MessageContent::Thinking(
+                    goose_providers::conversation::message::ThinkingContentBlock {
+                        thinking: text.to_string(),
+                        signature: String::new(),
+                    },
+                ))),
+                None,
+            ))
+        };
+        let provider = Arc::new(SequencedProvider::new(vec![Ok(vec![
+            Ok((Some(Message::assistant().with_text("Hel")), None)),
+            Ok((Some(Message::assistant().with_text("lo")), None)),
+            thinking("first"),
+            thinking("second"),
+            Ok((Some(Message::assistant().with_text("done")), None)),
+        ])]));
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model"),
+            "test-session",
+            "system",
+            &[Message::user().with_text("hi")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let mut messages = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let Some(message) = item?.0 {
+                messages.push(message);
+            }
+        }
+
+        let ids = messages
+            .iter()
+            .map(|message| message.id.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids[0], ids[1]);
+        assert_ne!(ids[2], ids[0]);
+        assert_eq!(ids[2], ids[3]);
+        assert_ne!(ids[4], ids[0]);
+        assert_ne!(ids[4], ids[3]);
         Ok(())
     }
 

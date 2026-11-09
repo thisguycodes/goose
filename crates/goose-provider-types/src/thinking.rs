@@ -55,6 +55,10 @@ impl ThinkFilter {
         }
     }
 
+    pub fn has_pending_state(&self) -> bool {
+        self.inside_think || !self.buffer.is_empty()
+    }
+
     pub fn push(&mut self, chunk: &str) -> FilterOut {
         self.buffer.push_str(chunk);
         self.process_buffer()
@@ -481,6 +485,18 @@ mod tests {
 
         assert!(out.content.is_empty());
         assert_eq!(out.thinking, "unfinished");
+    }
+
+    #[test]
+    fn test_think_filter_exposes_pending_state() {
+        let mut filter = ThinkFilter::new();
+        assert!(!filter.has_pending_state());
+        filter.push("visible<thi");
+        assert!(filter.has_pending_state());
+        filter.push("nk>");
+        assert!(filter.has_pending_state());
+        filter.push("private</think>");
+        assert!(!filter.has_pending_state());
     }
 
     #[test]

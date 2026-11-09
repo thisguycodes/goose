@@ -905,6 +905,7 @@ impl Provider for OpenAiProvider {
             if let Some(params) = declared_model.and_then(|m| m.request_params.as_ref()) {
                 apply_declared_request_params(&mut payload, params);
             }
+            enforce_continuation_request_params(&mut payload, model_config);
 
             let payload = self.sanitize_request_for_compat(payload, model_config);
             let mut log = start_log(model_config, &payload)?;
@@ -960,6 +961,20 @@ impl Provider for OpenAiProvider {
                 Ok(super::base::stream_from_single_message(message, usage))
             }
         }
+    }
+}
+
+fn enforce_continuation_request_params(
+    payload: &mut serde_json::Value,
+    model_config: &ModelConfig,
+) {
+    let is_continuation = model_config
+        .request_params
+        .as_ref()
+        .and_then(|params| params.get("add_generation_prompt"))
+        == Some(&serde_json::Value::Bool(false));
+    if is_continuation {
+        payload["add_generation_prompt"] = serde_json::Value::Bool(false);
     }
 }
 
@@ -2085,6 +2100,22 @@ mod tests {
         assert_eq!(payload["stream"], json!(true));
         assert_eq!(payload["stream_options"], json!({"include_usage": true}));
         assert_eq!(payload["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn continuation_generation_prompt_overrides_declared_parameters() {
+        let model_config = ModelConfig::new("test-model").with_merged_request_params(
+            HashMap::from([("add_generation_prompt".to_string(), json!(false))]),
+        );
+        let mut payload = json!({"add_generation_prompt": true});
+
+        apply_declared_request_params(
+            &mut payload,
+            &HashMap::from([("add_generation_prompt".to_string(), json!(true))]),
+        );
+        enforce_continuation_request_params(&mut payload, &model_config);
+
+        assert_eq!(payload["add_generation_prompt"], json!(false));
     }
 
     #[test]

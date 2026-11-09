@@ -429,14 +429,14 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
     ) -> Result<OperationResult<E>> {
         tracing::Span::current().record("error.type", err.telemetry_type());
         tracing::error!("LLM provider error: {err}");
-        if matches!(err, ProviderError::RateLimitExceeded { .. }) {
+        if err.is_rate_limit_exceeded() {
             emit.message(Message::user().with_system_notification(
                 SystemNotificationType::InlineMessage,
                 format!("{err}. Please try again later."),
             ));
         }
         let mut message = Message::from_provider_error(err);
-        if matches!(err, ProviderError::RateLimitExceeded { .. }) {
+        if err.is_rate_limit_exceeded() {
             message = message.with_visibility(false, false);
         }
         attach_operation_logs(&mut message, operation_logs);
@@ -586,9 +586,7 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
                 };
                 if let Some(usage) = usage_opt {
                     record_chat_usage(&tracing::Span::current(), &usage);
-                    let mut output = self.output();
-                    output.usage.truncate(attempt_start);
-                    output.usage.push(usage);
+                    self.output().usage.push(usage);
                 }
                 if let Some(mut chunk) = msg_opt {
                     if let Some(inference) = &inference {
@@ -627,6 +625,7 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
                 tracing::warn!(
                     "Provider returned an empty response; retrying ({empty_responses}/{MAX_EMPTY_RESPONSE_RETRIES})"
                 );
+                self.output().usage.truncate(attempt_start);
                 continue;
             }
             let mut marker = Message::assistant()
