@@ -24,6 +24,7 @@ use crate::openai_compatible::{
     annotate_request_id, handle_response_openai_compat, handle_status, stream_openai_compat,
     stream_responses_compat,
 };
+use crate::rate_limit::RateLimitTracker;
 use crate::request_log::{start_log, LoggerHandleExt};
 use crate::thinking::ThinkingEffort;
 use anyhow::Result;
@@ -144,6 +145,8 @@ pub struct OpenAiProvider {
     session_id_provider: Option<OpenAiSessionIdProvider>,
     #[serde(skip)]
     n_ctx_cache: Arc<Mutex<HashMap<String, CachedContextLimit>>>,
+    #[serde(skip)]
+    rate_limit_tracker: Arc<RateLimitTracker>,
 }
 
 impl std::fmt::Debug for OpenAiProvider {
@@ -289,6 +292,7 @@ impl OpenAiProviderBuilder {
             session_id_provider: self.session_id_provider,
             native_openai: self.native_openai,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit_tracker: Arc::new(RateLimitTracker::new()),
         }
     }
 }
@@ -347,19 +351,21 @@ impl OpenAiProvider {
         payload: &serde_json::Value,
     ) -> Result<reqwest::Response, ProviderError> {
         self.with_retry(|| async {
-            handle_status(
-                self.api_client
-                    .request(&Self::map_base_path(
-                        &self.base_path,
-                        "responses",
-                        OPEN_AI_DEFAULT_RESPONSES_PATH,
-                    ))
-                    .model_headers(model_config)?
-                    .streaming(self.supports_streaming)
-                    .response_post(payload)
-                    .await?,
-            )
-            .await
+            self.rate_limit_tracker.wait(&model_config.model_name).await;
+            let response = self
+                .api_client
+                .request(&Self::map_base_path(
+                    &self.base_path,
+                    "responses",
+                    OPEN_AI_DEFAULT_RESPONSES_PATH,
+                ))
+                .model_headers(model_config)?
+                .streaming(self.supports_streaming)
+                .response_post(payload)
+                .await?;
+            self.rate_limit_tracker
+                .handle_response(&model_config.model_name, response)
+                .await
         })
         .await
     }
@@ -442,6 +448,7 @@ impl OpenAiProvider {
             session_id_provider: None,
             native_openai: false,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit_tracker: Arc::new(RateLimitTracker::new()),
         }
     }
 
@@ -904,6 +911,7 @@ impl Provider for OpenAiProvider {
 
             let response = self
                 .with_retry(|| async {
+                    self.rate_limit_tracker.wait(&model_config.model_name).await;
                     let resp = self
                         .api_client
                         .request(&self.base_path)
@@ -911,7 +919,9 @@ impl Provider for OpenAiProvider {
                         .streaming(self.supports_streaming)
                         .response_post(&payload)
                         .await?;
-                    handle_status(resp).await
+                    self.rate_limit_tracker
+                        .handle_response(&model_config.model_name, resp)
+                        .await
                 })
                 .await
                 .inspect_err(|e| {
@@ -1116,6 +1126,7 @@ mod tests {
             session_id_provider: None,
             native_openai: false,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit_tracker: Arc::new(RateLimitTracker::new()),
         }
     }
 
@@ -1669,6 +1680,7 @@ mod tests {
             session_id_provider: None,
             native_openai: false,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit_tracker: Arc::new(RateLimitTracker::new()),
         }
     }
 

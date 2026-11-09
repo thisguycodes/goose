@@ -7,7 +7,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use goose_provider_types::base::Provider;
-use goose_provider_types::conversation::message::{InferenceMetadata, Message, MessageContent};
+use goose_provider_types::conversation::message::{
+    InferenceMetadata, Message, MessageContent, SystemNotificationType,
+};
 use goose_provider_types::conversation::token_usage::ProviderUsage;
 use goose_provider_types::conversation::{
     effective_role, fix_conversation, merge_consecutive_messages_for_request, Conversation,
@@ -15,6 +17,9 @@ use goose_provider_types::conversation::{
 };
 use goose_provider_types::errors::ProviderError;
 use goose_provider_types::model::ModelConfig;
+use goose_provider_types::retry::{
+    with_rate_limit_observer, RateLimitObserverRef, RateLimitWait, RateLimitWaitKind,
+};
 use tracing_futures::Instrument;
 
 use crate::machine::MachineSession;
@@ -319,6 +324,21 @@ fn latest_provider_session_id<'a>(
         .and_then(|inference| inference.provider_session_id.as_deref())
 }
 
+fn rate_limit_wait_message(wait: RateLimitWait) -> String {
+    let seconds = wait.delay.as_secs_f64().ceil().max(1.0) as u64;
+    match wait.kind {
+        RateLimitWaitKind::Retry {
+            attempt,
+            max_retries,
+        } => {
+            format!("Rate limit reached; retrying in {seconds}s (attempt {attempt}/{max_retries})")
+        }
+        RateLimitWaitKind::Proactive => {
+            format!("Rate limit reached; resuming in {seconds}s")
+        }
+    }
+}
+
 fn ends_with_provider_turn(messages: &[Message]) -> bool {
     messages.last().is_some_and(|message| {
         matches!(
@@ -409,7 +429,16 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
     ) -> Result<OperationResult<E>> {
         tracing::Span::current().record("error.type", err.telemetry_type());
         tracing::error!("LLM provider error: {err}");
+        if matches!(err, ProviderError::RateLimitExceeded { .. }) {
+            emit.message(Message::user().with_system_notification(
+                SystemNotificationType::InlineMessage,
+                format!("{err}. Please try again later."),
+            ));
+        }
         let mut message = Message::from_provider_error(err);
+        if matches!(err, ProviderError::RateLimitExceeded { .. }) {
+            message = message.with_visibility(false, false);
+        }
         attach_operation_logs(&mut message, operation_logs);
         self.emit_message(message, emit);
         applied(self.take_output())
@@ -506,18 +535,26 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
             );
             let successful_tool_response =
                 ends_with_successful_tool_response(conversation.messages());
+            let notification_emitter = emit.clone();
+            let rate_limit_observer: RateLimitObserverRef = Arc::new(move |wait| {
+                notification_emitter.message(Message::user().with_system_notification(
+                    SystemNotificationType::ProgressMessage,
+                    rate_limit_wait_message(wait),
+                ));
+            });
             let mut empty_responses = 0;
             let empty_output = loop {
             let attempt_start = self.output().usage.len();
-            let stream = self
-                .provider
-                .stream(
+            let stream = with_rate_limit_observer(
+                rate_limit_observer.clone(),
+                self.provider.stream(
                     &model_config,
                     &system_prompt,
                     conversation_for_provider.messages(),
                     &tools,
-                )
-                .await;
+                ),
+            )
+            .await;
 
             let mut stream = match stream {
                 Ok(stream) => stream,
@@ -540,7 +577,9 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
             });
 
             let mut tool_request_ids = HashSet::new();
-            while let Some(result) = stream.next().await {
+            while let Some(result) =
+                with_rate_limit_observer(rate_limit_observer.clone(), stream.next()).await
+            {
                 let (msg_opt, usage_opt) = match result {
                     Ok(chunk) => chunk,
                     Err(err) => return self.error_outcome(&err, &mut operation_logs, emit),
@@ -630,6 +669,24 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limit_notifications_include_resume_delay() {
+        let retry = rate_limit_wait_message(RateLimitWait {
+            kind: RateLimitWaitKind::Retry {
+                attempt: 2,
+                max_retries: 3,
+            },
+            delay: std::time::Duration::from_millis(12_500),
+        });
+        assert_eq!(retry, "Rate limit reached; retrying in 13s (attempt 2/3)");
+
+        let proactive = rate_limit_wait_message(RateLimitWait {
+            kind: RateLimitWaitKind::Proactive,
+            delay: std::time::Duration::from_secs(8),
+        });
+        assert_eq!(proactive, "Rate limit reached; resuming in 8s");
+    }
 
     #[test]
     fn provider_session_id_comes_only_from_latest_inference() {

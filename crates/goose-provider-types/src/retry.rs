@@ -3,6 +3,7 @@ use crate::errors::ProviderError;
 use crate::maybe_send::MaybeSend;
 use async_trait::async_trait;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 // wasm32 hosts run without a tokio runtime, so back off on the host's timer.
@@ -10,6 +11,60 @@ use std::time::Duration;
 use gloo_timers::future::sleep;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::sleep;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitWaitKind {
+    Retry { attempt: usize, max_retries: usize },
+    Proactive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitWait {
+    pub kind: RateLimitWaitKind,
+    pub delay: Duration,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub type RateLimitObserverRef = Arc<dyn Fn(RateLimitWait) + Send + Sync>;
+#[cfg(target_arch = "wasm32")]
+pub type RateLimitObserverRef = Arc<dyn Fn(RateLimitWait)>;
+
+tokio::task_local! {
+    static RATE_LIMIT_OBSERVER: RateLimitObserverRef;
+}
+
+pub async fn with_rate_limit_observer<F: Future>(
+    observer: RateLimitObserverRef,
+    future: F,
+) -> F::Output {
+    RATE_LIMIT_OBSERVER.scope(observer, future).await
+}
+
+pub async fn sleep_for_rate_limit(kind: RateLimitWaitKind, delay: Duration) -> bool {
+    if skip_backoff() || delay.is_zero() {
+        return false;
+    }
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        let _ = RATE_LIMIT_OBSERVER.try_with(|observer| {
+            observer(RateLimitWait {
+                kind,
+                delay: remaining,
+            })
+        });
+        let interval = remaining.min(Duration::from_secs(1));
+        sleep(interval).await;
+        remaining = remaining.saturating_sub(interval);
+    }
+    true
+}
+
+fn skip_backoff() -> bool {
+    std::env::var("GOOSE_PROVIDER_SKIP_BACKOFF")
+        .unwrap_or_default()
+        .parse::<bool>()
+        .unwrap_or(false)
+}
 
 pub const DEFAULT_MAX_RETRIES: usize = 3;
 pub const DEFAULT_INITIAL_RETRY_INTERVAL_MS: u64 = 1000;
@@ -116,6 +171,35 @@ pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
     }
 }
 
+pub async fn sleep_before_retry(error: &ProviderError, config: &RetryConfig, attempt: usize) {
+    let delay = match error {
+        ProviderError::RateLimitExceeded {
+            retry_delay: Some(delay),
+            ..
+        } => *delay,
+        _ => config.delay_for_attempt(attempt),
+    };
+
+    if matches!(error, ProviderError::RateLimitExceeded { .. }) {
+        sleep_for_rate_limit(
+            RateLimitWaitKind::Retry {
+                attempt,
+                max_retries: config.max_retries,
+            },
+            delay,
+        )
+        .await;
+        return;
+    }
+
+    if skip_backoff() {
+        tracing::info!("Skipping backoff due to GOOSE_PROVIDER_SKIP_BACKOFF");
+    } else {
+        tracing::info!("Backing off for {:?} before retry", delay);
+        sleep(delay).await;
+    }
+}
+
 pub async fn retry_operation<F, Fut, T>(
     config: &RetryConfig,
     operation: F,
@@ -140,15 +224,7 @@ where
                         error
                     );
 
-                    let delay = match &error {
-                        ProviderError::RateLimitExceeded {
-                            retry_delay: Some(d),
-                            ..
-                        } => *d,
-                        _ => config.delay_for_attempt(attempts),
-                    };
-
-                    sleep(delay).await;
+                    sleep_before_retry(&error, config, attempts).await;
                     continue;
                 }
                 return Err(error);
@@ -241,25 +317,7 @@ impl<P: Provider> ProviderRetry for P {
                             error
                         );
 
-                        let delay = match &error {
-                            ProviderError::RateLimitExceeded {
-                                retry_delay: Some(provider_delay),
-                                ..
-                            } => *provider_delay,
-                            _ => config.delay_for_attempt(attempts),
-                        };
-
-                        let skip_backoff = std::env::var("GOOSE_PROVIDER_SKIP_BACKOFF")
-                            .unwrap_or_default()
-                            .parse::<bool>()
-                            .unwrap_or(false);
-
-                        if skip_backoff {
-                            tracing::info!("Skipping backoff due to GOOSE_PROVIDER_SKIP_BACKOFF");
-                        } else {
-                            tracing::info!("Backing off for {:?} before retry", delay);
-                            sleep(delay).await;
-                        }
+                        sleep_before_retry(&error, &config, attempts).await;
                         continue;
                     }
 
@@ -346,6 +404,77 @@ mod tests {
             },
             &config
         ));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_retries_notify_scoped_observer() {
+        let waits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_waits = waits.clone();
+        let observer: RateLimitObserverRef = Arc::new(move |wait| {
+            observed_waits.lock().unwrap().push(wait);
+        });
+        let config = RetryConfig {
+            max_retries: 1,
+            initial_interval_ms: 0,
+            max_interval_ms: 0,
+            ..RetryConfig::default()
+        };
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let result = with_rate_limit_observer(observer, {
+            let attempts = attempts.clone();
+            retry_operation(&config, move || {
+                let attempts = attempts.clone();
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Err(ProviderError::RateLimitExceeded {
+                            details: "slow down".into(),
+                            retry_delay: Some(std::time::Duration::from_millis(1)),
+                        })
+                    } else {
+                        Ok("ok")
+                    }
+                }
+            })
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "ok");
+        let waits = waits.lock().unwrap();
+        assert_eq!(waits.len(), 1);
+        assert_eq!(
+            waits[0].kind,
+            RateLimitWaitKind::Retry {
+                attempt: 1,
+                max_retries: 1
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_wait_reports_countdown() {
+        let delays = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_delays = delays.clone();
+        let observer: RateLimitObserverRef = Arc::new(move |wait| {
+            observed_delays.lock().unwrap().push(wait.delay);
+        });
+
+        with_rate_limit_observer(
+            observer,
+            sleep_for_rate_limit(
+                RateLimitWaitKind::Proactive,
+                std::time::Duration::from_millis(1_100),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            *delays.lock().unwrap(),
+            [
+                std::time::Duration::from_millis(1_100),
+                std::time::Duration::from_millis(100)
+            ]
+        );
     }
 
     #[test]
