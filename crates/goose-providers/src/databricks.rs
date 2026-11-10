@@ -515,6 +515,7 @@ impl DatabricksProvider {
             supports_cache_control: None,
             reasoning,
             supports_vision: None,
+            supports_assistant_prefill: None,
             thinking_preservation_format: None,
             request_params: None,
         }

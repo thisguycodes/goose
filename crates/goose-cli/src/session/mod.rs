@@ -3068,6 +3068,7 @@ mod tests {
             )])),
             reasoning: Some(false),
             supports_vision: Some(true),
+            supports_assistant_prefill: None,
             request_headers: None,
         };
 

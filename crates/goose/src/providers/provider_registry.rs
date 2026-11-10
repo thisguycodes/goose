@@ -80,11 +80,14 @@ impl ProviderEntry {
         }
         // Declared model metadata is authoritative over canonical detection, which
         // may already have populated supports_vision earlier in materialization.
-        if let Some(supports_vision) =
-            find_declared_model(&self.metadata.known_models, &model.model_name)
-                .and_then(|m| m.supports_vision)
+        if let Some(declared) = find_declared_model(&self.metadata.known_models, &model.model_name)
         {
-            model.supports_vision = Some(supports_vision);
+            if let Some(supports_vision) = declared.supports_vision {
+                model.supports_vision = Some(supports_vision);
+            }
+            if let Some(supports_assistant_prefill) = declared.supports_assistant_prefill {
+                model.supports_assistant_prefill = Some(supports_assistant_prefill);
+            }
         }
         if let Some(catalog_provider_id) = &self.catalog_provider_id {
             model = model.with_canonical_vision_support(catalog_provider_id);
@@ -567,5 +570,33 @@ mod tests {
         assert_eq!(vision.supports_vision, Some(true));
         assert_eq!(text.supports_vision, Some(false));
         assert_eq!(undeclared.supports_vision, None);
+    }
+
+    #[test]
+    fn declared_assistant_prefill_support_is_normalized() {
+        let mut registry = ProviderRegistry::new(None);
+        let mut config = test_config();
+        config.models = vec![
+            ModelInfo::new("prefill-model").with_assistant_prefill_support(true),
+            ModelInfo::new("ordinary-model"),
+        ];
+        registry.register_with_name::<OpenAiProviderDef, _, _>(
+            &config,
+            ProviderType::Custom,
+            false,
+            |_| unreachable!("constructor is not used by this test"),
+            || Ok(InventoryIdentityInput::new("custom_hf", "custom_hf")),
+        );
+        let entry = &registry.entries["custom_hf"];
+
+        let prefill = entry
+            .normalize_model_config(ModelConfig::new("prefill-model"))
+            .unwrap();
+        let ordinary = entry
+            .normalize_model_config(ModelConfig::new("ordinary-model"))
+            .unwrap();
+
+        assert_eq!(prefill.supports_assistant_prefill, Some(true));
+        assert_eq!(ordinary.supports_assistant_prefill, None);
     }
 }

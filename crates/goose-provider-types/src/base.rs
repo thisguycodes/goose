@@ -275,6 +275,11 @@ pub struct ModelInfo {
     /// Whether this model accepts image input; when set, overrides canonical detection
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// Whether an unfinished assistant text response can be continued as a prefill.
+    /// OpenAI-compatible retries send `add_generation_prompt: false`; enable only
+    /// when the serving stack supports that extension and the model's chat template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_assistant_prefill: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_preservation_format: Option<ThinkingPreservationFormat>,
     /// Static params merged into the request body for this model.
@@ -296,6 +301,7 @@ impl ModelInfo {
             supports_cache_control: None,
             reasoning: false,
             supports_vision: None,
+            supports_assistant_prefill: None,
             thinking_preservation_format: None,
             request_params: None,
         }
@@ -313,6 +319,11 @@ impl ModelInfo {
 
     pub fn with_vision_support(mut self, supports_vision: bool) -> Self {
         self.supports_vision = Some(supports_vision);
+        self
+    }
+
+    pub fn with_assistant_prefill_support(mut self, supports_assistant_prefill: bool) -> Self {
+        self.supports_assistant_prefill = Some(supports_assistant_prefill);
         self
     }
 
@@ -335,6 +346,7 @@ impl ModelInfo {
             supports_cache_control: None,
             reasoning: false,
             supports_vision: None,
+            supports_assistant_prefill: None,
             thinking_preservation_format: None,
             request_params: None,
         }
@@ -388,6 +400,7 @@ pub fn model_info_for_provider_model(provider_name: &str, model_name: &str) -> M
         supports_cache_control: None,
         reasoning,
         supports_vision: None,
+        supports_assistant_prefill: None,
         thinking_preservation_format: None,
         request_params: None,
     }
@@ -1133,6 +1146,7 @@ mod tests {
             supports_cache_control: None,
             reasoning: false,
             supports_vision: None,
+            supports_assistant_prefill: None,
             thinking_preservation_format: None,
             request_params: None,
         };
@@ -1151,6 +1165,7 @@ mod tests {
             supports_cache_control: None,
             reasoning: false,
             supports_vision: None,
+            supports_assistant_prefill: None,
             thinking_preservation_format: None,
             request_params: None,
         };
@@ -1169,6 +1184,7 @@ mod tests {
             supports_cache_control: None,
             reasoning: false,
             supports_vision: None,
+            supports_assistant_prefill: None,
             thinking_preservation_format: None,
             request_params: None,
         };

@@ -1259,6 +1259,7 @@ mod tests {
                 request_params: None,
                 reasoning: None,
                 supports_vision: None,
+                supports_assistant_prefill: None,
                 request_headers: None,
             },
         )

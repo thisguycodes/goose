@@ -21,6 +21,13 @@ pub enum ProviderError {
         retry_delay: Option<Duration>,
     },
 
+    /// A rate limit after buffered non-text content that cannot be continued with text prefill.
+    #[error("Rate limit exceeded: {details}")]
+    RateLimitExceededAfterNonText {
+        details: String,
+        retry_delay: Option<Duration>,
+    },
+
     #[error("Server error: {0}")]
     ServerError(String),
 
@@ -70,7 +77,8 @@ impl ProviderError {
             ProviderError::NotConfigured => "not_configured",
             ProviderError::Authentication(_) => "auth",
             ProviderError::ContextLengthExceeded(_) => "context_length",
-            ProviderError::RateLimitExceeded { .. } => "rate_limit",
+            ProviderError::RateLimitExceeded { .. }
+            | ProviderError::RateLimitExceededAfterNonText { .. } => "rate_limit",
             ProviderError::ServerError(_) => "server",
             ProviderError::NetworkError(_) => "network",
             ProviderError::RequestFailed(_) => "request",
@@ -82,6 +90,14 @@ impl ProviderError {
             ProviderError::CreditsExhausted { .. } => "credits_exhausted",
             ProviderError::Refusal { .. } => "refusal",
         }
+    }
+
+    pub fn is_rate_limit_exceeded(&self) -> bool {
+        matches!(
+            self,
+            ProviderError::RateLimitExceeded { .. }
+                | ProviderError::RateLimitExceededAfterNonText { .. }
+        )
     }
 
     /// Mutable access to the detail text, for annotating an error after it was built.
@@ -99,6 +115,7 @@ impl ProviderError {
             | ProviderError::NotImplemented(details)
             | ProviderError::EndpointNotFound(details) => Some(details),
             ProviderError::RateLimitExceeded { details, .. }
+            | ProviderError::RateLimitExceededAfterNonText { details, .. }
             | ProviderError::CreditsExhausted { details, .. }
             | ProviderError::Refusal { details, .. } => Some(details),
         }

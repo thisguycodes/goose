@@ -1,4 +1,5 @@
 mod active_run;
+mod assistant_stream;
 pub mod container;
 pub mod context_report;
 pub mod execute_commands;
