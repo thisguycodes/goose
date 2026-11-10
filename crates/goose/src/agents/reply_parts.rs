@@ -337,25 +337,12 @@ pub(crate) async fn stream_response_from_provider(
                             && attempts < retry_config.max_retries =>
                     {
                         attempts += 1;
-                        let delay = match &error {
-                            ProviderError::RateLimitExceeded {
-                                retry_delay: Some(provider_delay),
-                                ..
-                            } => *provider_delay,
-                            _ => retry_config.delay_for_attempt(attempts),
-                        };
                         warn!(
                             "Provider stream failed before its first item, retrying ({}/{}): {:?}",
                             attempts, retry_config.max_retries, error
                         );
-
-                        let skip_backoff = std::env::var("GOOSE_PROVIDER_SKIP_BACKOFF")
-                            .unwrap_or_default()
-                            .parse::<bool>()
-                            .unwrap_or(false);
-                        if !skip_backoff {
-                            tokio::time::sleep(delay).await;
-                        }
+                        goose_providers::retry::sleep_before_retry(&error, &retry_config, attempts)
+                            .await;
 
                         stream = match crate::session_context::with_session_id(
                             Some(session_id.clone()),

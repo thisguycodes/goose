@@ -48,13 +48,14 @@ use agent_client_protocol::schema::v1::{
     DeleteSessionResponse, EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse,
     ImageContent, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
     ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
-    Meta, NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
-    PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, ResourceLink, SessionCapabilities, SessionCloseCapabilities,
-    SessionConfigOption, SessionDeleteCapabilities, SessionId, SessionInfoUpdate,
-    SessionListCapabilities, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCallId, ToolCallUpdate, Usage, UsageUpdate,
+    Meta, NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity, PermissionOption,
+    PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, SessionCapabilities,
+    SessionCloseCapabilities, SessionConfigOption, SessionDeleteCapabilities, SessionId,
+    SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TextContent, ToolCallId, ToolCallUpdate, Usage,
+    UsageUpdate,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::util::MatchDispatchFrom;
@@ -317,6 +318,7 @@ pub struct AcpConnection {
     connection_id: u64,
     client_supports_acp_elicitation: OnceCell<bool>,
     client_supports_goose_custom_notifications: OnceCell<bool>,
+    client_supports_acp_notices: OnceCell<bool>,
     client_supports_recipe_param_requests: OnceCell<bool>,
     client_requests_tool_call_label_enrichment: OnceCell<bool>,
     client_cx: OnceCell<ConnectionTo<Client>>,
@@ -899,6 +901,13 @@ impl AcpConnection {
             .unwrap_or(false)
     }
 
+    fn supports_acp_notices(&self) -> bool {
+        self.client_supports_acp_notices
+            .get()
+            .copied()
+            .unwrap_or(false)
+    }
+
     pub(super) async fn prepare_session_setup_by_id(
         &self,
         session_id: &str,
@@ -997,6 +1006,7 @@ impl AcpConnection {
             connection_id: NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             client_supports_acp_elicitation: OnceCell::new(),
             client_supports_goose_custom_notifications: OnceCell::new(),
+            client_supports_acp_notices: OnceCell::new(),
             client_supports_recipe_param_requests: OnceCell::new(),
             client_requests_tool_call_label_enrichment: OnceCell::new(),
             client_cx: OnceCell::new(),
@@ -1431,6 +1441,7 @@ impl AcpConnection {
                     notification,
                 )?;
             }
+            MessageContent::Error(_) if !message.metadata.user_visible => {}
             MessageContent::Error(error) => {
                 let chunk = content_chunk_for_message(
                     message,
@@ -1592,6 +1603,14 @@ fn extract_client_supports_goose_custom_notifications(
         .unwrap_or(false)
 }
 
+fn extract_client_supports_acp_notices(args: &InitializeRequest) -> bool {
+    args.client_capabilities
+        .session
+        .as_ref()
+        .and_then(|session| session.notices.as_ref())
+        .is_some()
+}
+
 fn extract_client_supports_recipe_param_requests(
     goose_client_capabilities: Option<&GooseClientCapabilities>,
 ) -> bool {
@@ -1688,6 +1707,31 @@ fn send_status_message_update(
     Ok(())
 }
 
+fn rate_limit_notice(notification: &SystemNotificationContent) -> Option<Notice> {
+    if notification.notification_type != SystemNotificationType::ProgressMessage
+        || !notification.msg.starts_with("Rate limit reached;")
+    {
+        return None;
+    }
+
+    Some(
+        Notice::new(NoticeSeverity::Info, "Rate limit reached")
+            .description(notification.msg.clone()),
+    )
+}
+
+fn standard_rate_limit_notice(
+    notification: &SystemNotificationContent,
+    supports_goose_custom_notifications: bool,
+    supports_acp_notices: bool,
+    already_sent: bool,
+) -> Option<Notice> {
+    if supports_goose_custom_notifications || !supports_acp_notices || already_sent {
+        return None;
+    }
+    rate_limit_notice(notification)
+}
+
 fn send_progress_message_update(
     cx: &ConnectionTo<Client>,
     supports_goose_custom_notifications: bool,
@@ -1764,6 +1808,9 @@ impl AcpConnection {
         let _ = self.client_supports_goose_custom_notifications.set(
             extract_client_supports_goose_custom_notifications(goose_client_capabilities.as_ref()),
         );
+        let _ = self
+            .client_supports_acp_notices
+            .set(extract_client_supports_acp_notices(&args));
         let _ = self.client_supports_recipe_param_requests.set(
             extract_client_supports_recipe_param_requests(goose_client_capabilities.as_ref()),
         );
@@ -2080,6 +2127,7 @@ impl AcpConnection {
         let mut chain_tracker = ToolChainTracker::default();
         let mut last_message_was_error = false;
         let mut context_limit = None;
+        let mut rate_limit_notice_sent = false;
         let target = SessionTarget {
             session_id: session_id.to_string(),
             cancel_token: Some(cancel_token.clone()),
@@ -2104,6 +2152,21 @@ impl AcpConnection {
                     for content_item in &message.content {
                         if let MessageContent::ToolRequest(tool_request) = content_item {
                             tool_requests.insert(tool_request.id.clone(), tool_request.clone());
+                        }
+
+                        if let MessageContent::SystemNotification(notification) = content_item {
+                            if let Some(notice) = standard_rate_limit_notice(
+                                notification,
+                                self.supports_goose_custom_notifications(),
+                                self.supports_acp_notices(),
+                                rate_limit_notice_sent,
+                            ) {
+                                cx.send_notification(SessionNotification::new(
+                                    acp_session_id.clone(),
+                                    SessionUpdate::Notice(notice),
+                                ))?;
+                                rate_limit_notice_sent = true;
+                            }
                         }
 
                         self.handle_message_content(
@@ -2685,9 +2748,10 @@ mod tests {
     use super::*;
     use crate::session::session_manager::SessionType;
     use agent_client_protocol::schema::v1::{
-        EmbeddedResource, EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse,
-        McpServerStdio, PermissionOptionId, ResourceLink, Role as AcpRole,
-        SelectedPermissionOutcome, TextResourceContents,
+        ClientCapabilities, ClientSessionCapabilities, EmbeddedResource, EnvVariable, HttpHeader,
+        McpServer, McpServerHttp, McpServerSse, McpServerStdio, NoticeCapabilities,
+        PermissionOptionId, ResourceLink, Role as AcpRole, SelectedPermissionOutcome,
+        TextResourceContents,
     };
     use goose_providers::conversation::token_usage::Usage as TokenUsage;
     use goose_providers::thinking::{
@@ -2697,6 +2761,60 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use test_case::test_case;
+
+    fn progress_notification(message: &str) -> SystemNotificationContent {
+        SystemNotificationContent {
+            notification_type: SystemNotificationType::ProgressMessage,
+            msg: message.to_string(),
+            data: None,
+        }
+    }
+
+    #[test]
+    fn acp_notice_capability_is_extracted_from_session_capabilities() {
+        let with_notices = InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+            ClientCapabilities::new()
+                .session(ClientSessionCapabilities::new().notices(NoticeCapabilities::new())),
+        );
+        assert!(extract_client_supports_acp_notices(&with_notices));
+
+        let without_notices = InitializeRequest::new(ProtocolVersion::V1);
+        assert!(!extract_client_supports_acp_notices(&without_notices));
+    }
+
+    #[test]
+    fn rate_limit_progress_maps_to_standard_acp_notice() {
+        let notification =
+            progress_notification("Rate limit reached; retrying in 13s (attempt 2/3).");
+        let notice = rate_limit_notice(&notification).expect("rate-limit notice");
+
+        assert_eq!(notice.severity, NoticeSeverity::Info);
+        assert_eq!(notice.title, "Rate limit reached");
+        assert_eq!(
+            notice.description.as_deref(),
+            Some(notification.msg.as_str())
+        );
+
+        let notification =
+            SessionNotification::new(SessionId::new("session"), SessionUpdate::Notice(notice));
+        let json = serde_json::to_value(notification).unwrap();
+        assert_eq!(json["update"]["sessionUpdate"], "notice");
+        assert_eq!(json["update"]["title"], "Rate limit reached");
+    }
+
+    #[test]
+    fn standard_rate_limit_notice_is_capability_gated_and_deduplicated() {
+        let notification =
+            progress_notification("Rate limit reached; retrying in 13s (attempt 2/3).");
+
+        assert!(standard_rate_limit_notice(&notification, true, true, false).is_none());
+        assert!(standard_rate_limit_notice(&notification, false, false, false).is_none());
+        assert!(standard_rate_limit_notice(&notification, false, true, true).is_none());
+        assert!(standard_rate_limit_notice(&notification, false, true, false).is_some());
+
+        let other_progress = progress_notification("Still working");
+        assert!(standard_rate_limit_notice(&other_progress, false, true, false).is_none());
+    }
 
     #[derive(Debug)]
     struct AsyncEffortProvider {

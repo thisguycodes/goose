@@ -1175,15 +1175,47 @@ fn stream_error_text(value: &Value) -> Option<String> {
 /// bug this skip exists to avoid. The converse matters just as much — a gateway that
 /// rate-limits with a bare `{"statusCode": 429, "message": …}` on an HTTP 200 must not be
 /// silently skipped, or a failed turn is reported as an empty successful one.
-fn classify_choiceless_frame(value: &Value) -> Option<ProviderError> {
-    let status = ["status", "statusCode", "code"].iter().find_map(|key| {
+fn stream_error_status(value: &Value) -> Option<i64> {
+    ["status", "statusCode", "code"].iter().find_map(|key| {
         let raw = value.get(*key)?;
         raw.as_i64()
             .or_else(|| raw.as_str().and_then(|s| s.parse::<i64>().ok()))
-    });
+    })
+}
+
+fn has_rate_limit_error_marker(value: &Value) -> bool {
+    ["type", "code"].iter().any(|key| {
+        matches!(
+            value.get(*key).and_then(Value::as_str),
+            Some("rate_limit_error" | "rate_limit_exceeded")
+        )
+    })
+}
+
+fn classify_stream_error(value: &Value, details: String) -> ProviderError {
+    let nested_error = value.get("error");
+    let status = nested_error
+        .and_then(stream_error_status)
+        .or_else(|| stream_error_status(value));
+    if status == Some(429)
+        || has_rate_limit_error_marker(value)
+        || nested_error.is_some_and(has_rate_limit_error_marker)
+    {
+        ProviderError::RateLimitExceeded {
+            details,
+            retry_delay: None,
+        }
+    } else {
+        ProviderError::ServerError(details)
+    }
+}
+
+fn classify_choiceless_frame(value: &Value) -> Option<ProviderError> {
+    let status = stream_error_status(value);
 
     let has_error_signal = status.is_some_and(|s| s >= 400)
         || value.get("type").and_then(|t| t.as_str()) == Some("error")
+        || has_rate_limit_error_marker(value)
         || value.get("detail").is_some_and(|d| !d.is_null());
     if !has_error_signal {
         return None;
@@ -1199,7 +1231,7 @@ fn classify_choiceless_frame(value: &Value) -> Option<ProviderError> {
             Some(s) => format!("Gateway returned status {s} mid-stream"),
             None => "Unknown server error".to_string(),
         });
-    Some(ProviderError::ServerError(details))
+    Some(classify_stream_error(value, details))
 }
 
 /// Parse one SSE `data:` payload.
@@ -1227,7 +1259,7 @@ fn parse_streaming_chunk(line: &str) -> Result<Option<StreamingChunk>, ProviderE
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown server error");
-        return Err(ProviderError::ServerError(message.to_string()));
+        return Err(classify_stream_error(&value, message.to_string()));
     }
 
     if value.get("object").and_then(|o| o.as_str()) == Some("error") {
@@ -1235,7 +1267,7 @@ fn parse_streaming_chunk(line: &str) -> Result<Option<StreamingChunk>, ProviderE
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown server error");
-        return Err(ProviderError::ServerError(message.to_string()));
+        return Err(classify_stream_error(&value, message.to_string()));
     }
 
     if value
@@ -5191,9 +5223,6 @@ data: [DONE]"#;
         for line in [
             r#"{"error":{"message":"upstream exploded"}}"#,
             r#"{"object":"error","message":"upstream exploded"}"#,
-            // No `error` key and no `object`: the shape Azure APIM rate-limits with, on an
-            // HTTP 200. Skipping this would report the failed turn as an empty success.
-            r#"{"statusCode":429,"message":"upstream exploded"}"#,
             // Some gateways stringify the status.
             r#"{"status":"503","message":"upstream exploded"}"#,
             // FastAPI's HTTPException shape.
@@ -5212,6 +5241,28 @@ data: [DONE]"#;
                     "message preserved for {line}, got {msg:?}"
                 ),
                 other => panic!("expected ServerError for {line}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limit_error_frames_preserve_error_kind() {
+        for line in [
+            r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#,
+            r#"{"error":{"message":"rate limited","code":"rate_limit_exceeded"}}"#,
+            r#"{"error":{"message":"rate limited","code":429}}"#,
+            r#"{"object":"error","message":"rate limited","code":"429"}"#,
+            r#"{"statusCode":429,"message":"rate limited"}"#,
+            r#"{"status":200,"error":{"message":"rate limited","code":429}}"#,
+            r#"{"type":"error","error":{"message":"rate limited","type":"rate_limit_error"}}"#,
+            r#"{"type":"rate_limit_error","message":"rate limited"}"#,
+            r#"{"code":"rate_limit_exceeded","message":"rate limited"}"#,
+        ] {
+            match parse_streaming_chunk(line) {
+                Err(ProviderError::RateLimitExceeded { details, .. }) => {
+                    assert_eq!(details, "rate limited")
+                }
+                other => panic!("expected RateLimitExceeded for {line}, got {other:?}"),
             }
         }
     }

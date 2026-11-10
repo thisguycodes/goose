@@ -63,6 +63,120 @@ pub fn extract_retry_after(headers: &HeaderMap, payload: Option<&Value>) -> Opti
         .get(RETRY_AFTER)
         .and_then(|h| h.to_str().ok())
         .and_then(|s| parse_retry_after_header(s.trim()))
+        .or_else(|| RateLimitHeaders::from_headers(headers).retry_reset_delay())
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RateLimitHeaders {
+    pub remaining_requests: Option<u64>,
+    pub remaining_tokens: Option<u64>,
+    pub remaining_project_tokens: Option<u64>,
+    pub reset_requests: Option<Duration>,
+    pub reset_tokens: Option<Duration>,
+    pub reset_project_tokens: Option<Duration>,
+}
+
+impl RateLimitHeaders {
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            remaining_requests: header_u64(headers, "x-ratelimit-remaining-requests"),
+            remaining_tokens: header_u64(headers, "x-ratelimit-remaining-tokens"),
+            remaining_project_tokens: header_u64(headers, "x-ratelimit-remaining-project-tokens"),
+            reset_requests: header_duration(headers, "x-ratelimit-reset-requests"),
+            reset_tokens: header_duration(headers, "x-ratelimit-reset-tokens"),
+            reset_project_tokens: header_duration(headers, "x-ratelimit-reset-project-tokens"),
+        }
+    }
+
+    pub(crate) fn retry_reset_delay(&self) -> Option<Duration> {
+        self.exhausted_reset_delay().or_else(|| {
+            [
+                (self.remaining_requests, self.reset_requests),
+                (self.remaining_tokens, self.reset_tokens),
+                (self.remaining_project_tokens, self.reset_project_tokens),
+            ]
+            .into_iter()
+            .filter_map(|(remaining, reset)| remaining.is_some().then_some(reset).flatten())
+            .max()
+        })
+    }
+
+    pub(crate) fn model_reset_delay(&self) -> Option<Duration> {
+        [
+            (self.remaining_requests, self.reset_requests),
+            (self.remaining_tokens, self.reset_tokens),
+        ]
+        .into_iter()
+        .filter_map(|(remaining, reset)| (remaining == Some(0)).then_some(reset).flatten())
+        .max()
+    }
+
+    pub(crate) fn project_reset_delay(&self) -> Option<Duration> {
+        (self.remaining_project_tokens == Some(0))
+            .then_some(self.reset_project_tokens)
+            .flatten()
+    }
+
+    pub(crate) fn exhausted_reset_delay(&self) -> Option<Duration> {
+        self.model_reset_delay().max(self.project_reset_delay())
+    }
+}
+
+fn header_u64(headers: &HeaderMap, name: &'static str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
+}
+
+fn header_duration(headers: &HeaderMap, name: &'static str) -> Option<Duration> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_openai_duration(value.trim()))
+}
+
+fn parse_openai_duration(value: &str) -> Option<Duration> {
+    if let Ok(seconds) = value.parse::<f64>() {
+        return duration_from_finite_secs(seconds);
+    }
+
+    let mut rest = value;
+    let mut total_seconds = 0.0;
+    let mut components = 0;
+    while !rest.is_empty() {
+        let number_end = rest
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_digit() || *c == '.')
+            .map(|(index, c)| index + c.len_utf8())
+            .last()
+            .unwrap_or(0);
+        let number = rest.get(..number_end)?.parse::<f64>().ok()?;
+        let unit = rest.get(number_end..)?;
+        let (multiplier, unit_len) = if unit.starts_with("ms") {
+            (0.001, 2)
+        } else if unit.starts_with('h') {
+            (3600.0, 1)
+        } else if unit.starts_with('m') {
+            (60.0, 1)
+        } else if unit.starts_with('s') {
+            (1.0, 1)
+        } else {
+            return None;
+        };
+        total_seconds += number * multiplier;
+        if !total_seconds.is_finite() || total_seconds < 0.0 {
+            return None;
+        }
+        components += 1;
+        rest = unit.get(unit_len..)?;
+    }
+
+    if components == 0 {
+        None
+    } else {
+        duration_from_finite_secs(total_seconds)
+    }
 }
 
 /// Convert a finite, non-negative, in-range seconds value to a `Duration`.
@@ -825,6 +939,110 @@ mod tests {
         let payload = json!({ "error": { "message": "rate limited" } });
         let delay = extract_retry_after(&empty_headers(), Some(&payload));
         assert!(delay.is_none());
+    }
+
+    #[test]
+    fn retry_after_prefers_header_over_openai_reset_headers() {
+        let mut headers = headers_with_retry_after("17");
+        headers.insert("x-ratelimit-reset-requests", "6m0s".parse().unwrap());
+        assert_eq!(
+            extract_retry_after(&headers, None),
+            Some(Duration::from_secs(17))
+        );
+    }
+
+    #[test]
+    fn openai_reset_headers_provide_retry_delay_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining-requests", "0".parse().unwrap());
+        headers.insert("x-ratelimit-remaining-tokens", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset-requests", "20ms".parse().unwrap());
+        headers.insert("x-ratelimit-reset-tokens", "6m0s".parse().unwrap());
+        assert_eq!(
+            extract_retry_after(&headers, None),
+            Some(Duration::from_secs(360))
+        );
+    }
+
+    #[test]
+    fn reset_without_remaining_does_not_imply_exhaustion() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-reset-requests", "6m0s".parse().unwrap());
+        let status = RateLimitHeaders::from_headers(&headers);
+        assert_eq!(status.retry_reset_delay(), None);
+        assert_eq!(status.exhausted_reset_delay(), None);
+    }
+
+    #[test]
+    fn retry_delay_uses_reset_when_429_leaves_quota_remaining() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining-tokens", "10".parse().unwrap());
+        headers.insert("x-ratelimit-reset-tokens", "2s".parse().unwrap());
+        let status = RateLimitHeaders::from_headers(&headers);
+        assert_eq!(status.retry_reset_delay(), Some(Duration::from_secs(2)));
+        assert_eq!(status.exhausted_reset_delay(), None);
+    }
+
+    #[test]
+    fn reset_delay_uses_only_exhausted_buckets_when_counts_are_present() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining-requests", "10".parse().unwrap());
+        headers.insert("x-ratelimit-remaining-tokens", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset-requests", "1s".parse().unwrap());
+        headers.insert("x-ratelimit-reset-tokens", "1.5s".parse().unwrap());
+        let status = RateLimitHeaders::from_headers(&headers);
+        assert_eq!(
+            status.exhausted_reset_delay(),
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    #[test]
+    fn proactive_delay_requires_an_exhausted_bucket_and_reset() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining-requests", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset-tokens", "1s".parse().unwrap());
+        assert_eq!(
+            RateLimitHeaders::from_headers(&headers).exhausted_reset_delay(),
+            None
+        );
+
+        headers.insert("x-ratelimit-reset-requests", "20ms".parse().unwrap());
+        assert_eq!(
+            RateLimitHeaders::from_headers(&headers).exhausted_reset_delay(),
+            Some(Duration::from_millis(20))
+        );
+    }
+
+    #[test]
+    fn openai_project_token_reset_is_supported() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining-project-tokens", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset-project-tokens", "2s".parse().unwrap());
+        assert_eq!(
+            RateLimitHeaders::from_headers(&headers).exhausted_reset_delay(),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn openai_duration_parser_rejects_invalid_values() {
+        for value in ["", "-1s", "1m 2s", "NaN", "inf", "1d", "s"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ratelimit-reset-requests", value.parse().unwrap());
+            assert_eq!(
+                RateLimitHeaders::from_headers(&headers).reset_requests,
+                None,
+                "value: {value}"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-reset-requests", "2".parse().unwrap());
+        assert_eq!(
+            RateLimitHeaders::from_headers(&headers).reset_requests,
+            Some(Duration::from_secs(2))
+        );
     }
 
     #[test]

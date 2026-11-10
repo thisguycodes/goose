@@ -25,8 +25,10 @@ use crate::formats::openai::{
 };
 use crate::formats::openai_responses::responses_api_to_streaming_message;
 use crate::model::ModelConfig;
+use crate::rate_limit::RateLimitTracker;
 use crate::request_log::{start_log, LoggerHandleExt, RequestLogHandle};
 use rmcp::model::Tool;
+use std::sync::Arc;
 
 pub struct OpenAiCompatibleProvider {
     name: String,
@@ -35,6 +37,7 @@ pub struct OpenAiCompatibleProvider {
     /// Path prefix prepended to `chat/completions` (e.g. `"deployments/{name}/"` for Azure).
     completions_prefix: String,
     supports_streaming: bool,
+    rate_limit_tracker: Arc<RateLimitTracker>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -44,6 +47,7 @@ impl OpenAiCompatibleProvider {
             api_client,
             completions_prefix,
             supports_streaming: true,
+            rate_limit_tracker: Arc::new(RateLimitTracker::new()),
         }
     }
 
@@ -111,15 +115,17 @@ impl OpenAiCompatibleProvider {
         let path = format!("{}chat/completions", self.completions_prefix);
         let response = self
             .with_retry(|| async {
-                handle_status(
-                    self.api_client
-                        .request(&path)
-                        .model_headers(model_config)?
-                        .streaming(self.supports_streaming)
-                        .response_post(&payload)
-                        .await?,
-                )
-                .await
+                self.rate_limit_tracker.wait(&model_config.model_name).await;
+                let response = self
+                    .api_client
+                    .request(&path)
+                    .model_headers(model_config)?
+                    .streaming(self.supports_streaming)
+                    .response_post(&payload)
+                    .await?;
+                self.rate_limit_tracker
+                    .handle_response(&model_config.model_name, response)
+                    .await
             })
             .await
             .inspect_err(|e| {
