@@ -750,13 +750,15 @@ mod tests {
 
     /// Pins the settings these tests depend on, whatever the developer's shell
     /// has exported, for as long as the guard lives.
+    const PINNED_SETTINGS: [&str; 4] = [
+        STREAM_RESUME_ENV,
+        MAX_STREAM_RESUMES_ENV,
+        STREAM_RESUME_PARAMS_ENV,
+        "GOOSE_PROVIDER_SKIP_BACKOFF",
+    ];
+
     fn settings() -> env_lock::EnvGuard<'static> {
-        env_lock::lock_env([
-            (STREAM_RESUME_ENV, None::<&str>),
-            (MAX_STREAM_RESUMES_ENV, None),
-            (STREAM_RESUME_PARAMS_ENV, None),
-            ("GOOSE_PROVIDER_SKIP_BACKOFF", None),
-        ])
+        env_lock::lock_env(PINNED_SETTINGS.map(|name| (name, None::<&str>)))
     }
 
     async fn run(provider: &Arc<ScriptedProvider>) -> Outcome {
@@ -1167,10 +1169,13 @@ mod tests {
     }
 
     async fn run_with(
-        settings: &[(&'static str, Option<&'static str>)],
+        name: &'static str,
+        value: &'static str,
         provider: &Arc<ScriptedProvider>,
     ) -> Outcome {
-        let _settings = env_lock::lock_env(settings.iter().copied());
+        let _settings = env_lock::lock_env(
+            PINNED_SETTINGS.map(|pinned| (pinned, (pinned == name).then_some(value))),
+        );
         collect(provider).await
     }
 
@@ -1188,7 +1193,7 @@ mod tests {
     async fn resume_can_be_switched_off() {
         let provider = interrupted_then_finished(prefill_policy());
 
-        let outcome = run_with(&[(STREAM_RESUME_ENV, Some("off"))], &provider).await;
+        let outcome = run_with(STREAM_RESUME_ENV, "off", &provider).await;
 
         assert_eq!(outcome.error, Some(connection_reset()));
         assert_eq!(provider.call_count(), 1);
@@ -1198,7 +1203,7 @@ mod tests {
     async fn prefill_can_be_switched_on_for_a_provider_without_a_policy() {
         let provider = interrupted_then_finished(StreamResumePolicy::default());
 
-        let outcome = run_with(&[(STREAM_RESUME_ENV, Some("prefill"))], &provider).await;
+        let outcome = run_with(STREAM_RESUME_ENV, "prefill", &provider).await;
 
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.text(), "Hello, world");
@@ -1208,11 +1213,7 @@ mod tests {
     async fn configured_parameters_replace_the_providers() {
         let provider = interrupted_then_finished(prefill_policy());
 
-        let outcome = run_with(
-            &[(STREAM_RESUME_PARAMS_ENV, Some(r#"{"prefix": true}"#))],
-            &provider,
-        )
-        .await;
+        let outcome = run_with(STREAM_RESUME_PARAMS_ENV, r#"{"prefix": true}"#, &provider).await;
 
         assert_eq!(outcome.text(), "Hello, world");
         let calls = provider.calls.lock().unwrap();
@@ -1226,7 +1227,7 @@ mod tests {
     async fn resume_limit_of_zero_never_resumes() {
         let provider = interrupted_then_finished(prefill_policy());
 
-        let outcome = run_with(&[(MAX_STREAM_RESUMES_ENV, Some("0"))], &provider).await;
+        let outcome = run_with(MAX_STREAM_RESUMES_ENV, "0", &provider).await;
 
         assert_eq!(outcome.error, Some(connection_reset()));
         assert_eq!(provider.call_count(), 1);

@@ -32,7 +32,8 @@ pub enum RetryNotice {
         attempt: usize,
         max_attempts: usize,
     },
-    /// The model ran out of output tokens and the response is being continued.
+    /// The model ran out of output tokens and is asked for the rest, or for the
+    /// whole response again if it had not started on the answer.
     ContinuingAfterOutputLimit { attempt: usize, max_attempts: usize },
 }
 
@@ -62,7 +63,7 @@ impl RetryNotice {
                 attempt,
                 max_attempts,
             } => format!(
-                "The model reached its output-token limit. Continuing the response \
+                "The model reached its output-token limit. Asking it to finish the response \
                  (attempt {attempt} of {max_attempts})."
             ),
         }

@@ -422,8 +422,8 @@ fn response_that_hits_the_output_limit_is_continued_and_announced() {
             received.notices(),
             vec![(
                 NoticeSeverity::Info,
-                "The model reached its output-token limit. Continuing the response \
-                 (attempt 1 of 3)."
+                "The model reached its output-token limit. Asking it to finish the \
+                 response (attempt 1 of 3)."
                     .to_string(),
                 None
             )]

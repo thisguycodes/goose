@@ -71,6 +71,12 @@ impl Operation<Session, GooseEffect> for ToolPairCompactionOperation {
         if !self.enabled {
             return not_applicable();
         }
+        // The turn is about to end on this error. Asking the provider again
+        // would report retries after it, and consumers read the turn's
+        // outcome from the last message.
+        if crate::agents::state_machine::ops_exit_on_error::turn_failure(conversation).is_some() {
+            return not_applicable();
+        }
 
         let protected = messages_since_kickoff(conversation)?
             .iter()
