@@ -93,7 +93,7 @@ Configurable retry parameters for LLM providers.
 
 #### All Providers
 
-A request that fails with a rate limit (HTTP 429), an overloaded or server error (5xx, including 529), or a network error is retried with exponential backoff. When the response says how long to wait (`Retry-After`, `retry-after-ms`, or the `x-ratelimit-reset-*` time of an exhausted limit), goose waits that long instead. A hint shorter than one second or longer than an hour is ignored and normal backoff applies. Each retry is announced as a notification rather than added to the conversation, in the goose CLI and Desktop and in ACP clients that can present notices.
+A request that fails with a rate limit (HTTP 429), an overloaded or server error (5xx, including 529), or a network error is retried with exponential backoff. When the response says how long to wait (`Retry-After`, `retry-after-ms`, or the `x-ratelimit-reset-*` time of an exhausted limit), goose waits that long instead. A hint shorter than one second is ignored and normal backoff applies; a `Retry-After` longer than an hour is capped at an hour, and other hints longer than an hour are ignored. Each retry is announced as a notification rather than added to the conversation, in the goose CLI and Desktop and in ACP clients that can present notices.
 
 A rate-limit or overload response gets more attempts than other errors, unless the provider asks to wait more than a minute or reports an exhausted quota. A server error that asks for a wait of more than a minute is not waited out.
 
@@ -104,7 +104,7 @@ A response that stops part-way can be continued instead of failing the turn. goo
 | `GOOSE_PROVIDER_RATE_LIMIT_MAX_RETRIES` | The max number of retry attempts for rate-limit and overload responses | 6 for providers that use the default of 3 retries, otherwise the provider's own limit |
 | `GOOSE_PROVIDER_STREAM_RESUME` | `off` never sends a request again once its response has started. `prefill` continues an interrupted response from a prefill on any provider | Prefill for Baseten Model APIs only |
 | `GOOSE_PROVIDER_MAX_STREAM_RESUMES` | How many times one response is resumed after an interruption, and how many times it is continued after reaching the output-token limit | 3 |
-| `GOOSE_PROVIDER_STREAM_RESUME_PARAMS` | A JSON object of request parameters sent with a prefilled request, replacing the provider's own | Provider-specific |
+| `GOOSE_PROVIDER_STREAM_RESUME_PARAMS` | A JSON object of request parameters sent with a prefilled request, replacing the provider's own. With `"echo": true`, the continuation is only used if it starts by repeating the prefill | Provider-specific |
 | `GOOSE_PROVIDER_SKIP_BACKOFF` | Set to `true` to retry immediately instead of waiting | false |
 
 **Examples**
@@ -112,7 +112,7 @@ A response that stops part-way can be continued instead of failing the turn. goo
 ```bash
 export GOOSE_PROVIDER_RATE_LIMIT_MAX_RETRIES=10    # keep retrying a rate limit for longer
 export GOOSE_PROVIDER_STREAM_RESUME=prefill        # resume interrupted responses on a vLLM-compatible server
-export GOOSE_PROVIDER_STREAM_RESUME_PARAMS='{"add_generation_prompt": false, "continue_final_message": true}'
+export GOOSE_PROVIDER_STREAM_RESUME_PARAMS='{"add_generation_prompt": false, "continue_final_message": true, "echo": true}'
 ```
 
 #### AWS Bedrock

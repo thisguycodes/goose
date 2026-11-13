@@ -50,6 +50,10 @@ pub struct StreamResumePolicy {
     pub prefill: bool,
     /// Request parameters that make the provider continue the prefill.
     pub prefill_request_params: HashMap<String, Value>,
+    /// Those parameters also make the provider repeat the prefill ahead of the
+    /// continuation. The repeat is checked and removed, so output that does not
+    /// start with the prefill is recognised as a fresh answer and discarded.
+    pub echoes_prefill: bool,
     /// Every complete response reports a finish reason, so a stream that ends
     /// without one was cut off.
     pub requires_finish_reason: bool,
@@ -64,6 +68,49 @@ enum AttemptEnd {
     Complete,
     OutputLimit,
     Interrupted(ProviderError),
+    /// The provider answered a prefilled request without continuing the prefill.
+    NotContinued,
+}
+
+/// Confirms that a continuation starts by repeating the prefill.
+struct EchoCheck {
+    prefill: String,
+    seen: String,
+}
+
+enum Echo {
+    Incomplete,
+    /// The prefill was repeated; this is the text that follows it.
+    Confirmed(String),
+    Missing,
+}
+
+impl EchoCheck {
+    fn new(prefill: &str) -> Self {
+        Self {
+            prefill: prefill.to_string(),
+            seen: String::new(),
+        }
+    }
+
+    fn take(&mut self, text: &str) -> Echo {
+        self.seen.push_str(text);
+        if let Some(rest) = self.seen.strip_prefix(self.prefill.as_str()) {
+            return Echo::Confirmed(rest.to_string());
+        }
+        if self.seen.len() < self.prefill.len() {
+            return if self.prefill.starts_with(self.seen.as_str()) {
+                Echo::Incomplete
+            } else {
+                Echo::Missing
+            };
+        }
+        // A server may trim the message it repeats.
+        match self.seen.strip_prefix(self.prefill.trim_end()) {
+            Some(rest) => Echo::Confirmed(rest.to_string()),
+            None => Echo::Missing,
+        }
+    }
 }
 
 /// Why the response is being asked for again.
@@ -189,6 +236,7 @@ fn effective_policy(
         _ => {}
     }
     if let Some(params) = configured_prefill_params() {
+        policy.echoes_prefill = params.get("echo") == Some(&Value::Bool(true));
         policy.prefill_request_params = params;
     }
     Some(policy)
@@ -291,6 +339,7 @@ pub async fn stream(
         let mut output_limit_continuations = 0;
         let mut max_tokens = request.model_config.max_tokens;
         let mut continuing: Option<Continuing> = None;
+        let mut echo: Option<EchoCheck> = None;
 
         loop {
             let mut finish_seen = false;
@@ -314,6 +363,9 @@ pub async fn stream(
                 };
                 delivered.started = true;
                 finish_seen |= reports_finish_reason(usage.as_ref());
+                // Set when content is taken out of the message here, so that a
+                // message left empty by that is not delivered.
+                let mut stripped = false;
 
                 if let Some(limited) = message
                     .as_mut()
@@ -331,15 +383,39 @@ pub async fn stream(
                             || raise_output_budget(max_tokens, &policy) > budget);
                     if can_continue {
                         output_limit_reached = true;
+                        stripped = true;
                         limited.metadata.output_token_limit_reached = false;
                         limited
                             .content
                             .retain(|content| !matches!(content, MessageContent::ToolRequest(_)));
                     }
                 }
-                // Only the truncated tool calls were left in it; there is nothing to deliver.
-                let emptied = output_limit_reached
-                    && message.as_ref().is_some_and(|message| message.content.is_empty());
+                if let (Some(check), Some(continued)) = (echo.as_mut(), message.as_mut()) {
+                    if has_tool_request(Some(continued)) {
+                        break AttemptEnd::NotContinued;
+                    }
+                    stripped = true;
+                    let mut text = String::new();
+                    continued.content.retain(|content| match content {
+                        MessageContent::Text(delta) => {
+                            text.push_str(&delta.text);
+                            false
+                        }
+                        _ => true,
+                    });
+                    match check.take(&text) {
+                        Echo::Incomplete => {}
+                        Echo::Confirmed(rest) => {
+                            if !rest.is_empty() {
+                                continued.content.push(MessageContent::text(rest));
+                            }
+                            echo = None;
+                        }
+                        Echo::Missing => break AttemptEnd::NotContinued,
+                    }
+                }
+                let emptied =
+                    stripped && message.as_ref().is_some_and(|message| message.content.is_empty());
                 if emptied {
                     message = None;
                 }
@@ -371,22 +447,24 @@ pub async fn stream(
             let prefilled = continuing.is_some() && progress_before.0 > 0;
             let no_progress =
                 progress_before == (delivered.text.len(), delivered.tool_request);
-            let next = match end {
-                // A prefilled request that adds nothing was not a continuation:
-                // the model saw a finished turn and had nothing to say.
-                AttemptEnd::Complete if prefilled && no_progress => {
-                    match continuing {
-                        Some(Continuing::AfterInterruption(error)) => {
-                            Err::<(), ProviderError>(error)?
-                        }
-                        _ => {
-                            let marker = output_limit_marker(delivered.anchor_id.clone());
-                            yield (Some(marker), None);
-                        }
+            // A prefilled request that adds nothing was not a continuation
+            // either: the model saw a finished turn and had nothing to say.
+            let not_continued = matches!(end, AttemptEnd::NotContinued)
+                || (matches!(end, AttemptEnd::Complete) && prefilled && no_progress);
+            if not_continued {
+                match continuing {
+                    Some(Continuing::AfterInterruption(error)) => {
+                        Err::<(), ProviderError>(error)?
                     }
-                    break;
+                    _ => {
+                        let marker = output_limit_marker(delivered.anchor_id.clone());
+                        yield (Some(marker), None);
+                    }
                 }
-                AttemptEnd::Complete => break,
+                break;
+            }
+            let next = match end {
+                AttemptEnd::Complete | AttemptEnd::NotContinued => break,
                 AttemptEnd::OutputLimit => {
                     output_limit_continuations += 1;
                     retry_notice::notify(RetryNotice::ContinuingAfterOutputLimit {
@@ -451,6 +529,8 @@ pub async fn stream(
                 }
             };
             continuing = Some(next);
+            echo = (policy.echoes_prefill && !delivered.text.is_empty())
+                .then(|| EchoCheck::new(&delivered.text));
         }
     }))
 }
@@ -550,6 +630,7 @@ mod tests {
                 "add_generation_prompt".to_string(),
                 json!(false),
             )]),
+            echoes_prefill: false,
             requires_finish_reason: true,
             default_max_tokens: Some(4096),
         }
@@ -942,6 +1023,91 @@ mod tests {
             Some(Err(ProviderError::NetworkError(_)))
         ));
         assert_eq!(provider.call_count(), 1 + DEFAULT_MAX_STREAM_RESUMES);
+    }
+
+    fn echoing_policy() -> StreamResumePolicy {
+        StreamResumePolicy {
+            echoes_prefill: true,
+            ..prefill_policy()
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_prefill_is_checked_and_removed() {
+        let provider = ScriptedProvider::new(
+            echoing_policy(),
+            vec![
+                Ok(vec![text("first", "Hello, "), Err(connection_reset())]),
+                Ok(vec![
+                    text("second", "Hel"),
+                    text("second", "lo, wor"),
+                    text("second", "ld"),
+                    finished("stop"),
+                ]),
+            ],
+        );
+
+        let outcome = run(&provider).await;
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.text(), "Hello, world");
+    }
+
+    #[tokio::test]
+    async fn prefill_repeated_without_its_trailing_whitespace_is_accepted() {
+        let provider = ScriptedProvider::new(
+            echoing_policy(),
+            vec![
+                Ok(vec![text("first", "Hello, "), Err(connection_reset())]),
+                Ok(vec![text("second", "Hello,\nworld"), finished("stop")]),
+            ],
+        );
+
+        let outcome = run(&provider).await;
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.text(), "Hello, \nworld");
+    }
+
+    #[tokio::test]
+    async fn answer_that_does_not_repeat_the_prefill_is_discarded() {
+        let provider = ScriptedProvider::new(
+            echoing_policy(),
+            vec![
+                Ok(vec![text("first", "Hello, "), Err(connection_reset())]),
+                Ok(vec![
+                    text("second", "Hi! How can I help?"),
+                    finished("stop"),
+                ]),
+            ],
+        );
+
+        let outcome = run(&provider).await;
+
+        assert_eq!(outcome.error, Some(connection_reset()));
+        assert_eq!(outcome.text(), "Hello, ");
+        assert_eq!(provider.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn output_limit_is_reported_when_the_continuation_does_not_repeat_the_prefill() {
+        let provider = ScriptedProvider::new(
+            echoing_policy(),
+            vec![
+                Ok(vec![
+                    text("first", "Part one, "),
+                    limit_marker("first"),
+                    finished("length"),
+                ]),
+                Ok(vec![text("second", "Starting over."), finished("stop")]),
+            ],
+        );
+
+        let outcome = run(&provider).await;
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.text(), "Part one, ");
+        assert!(outcome.output_limit_reached());
     }
 
     #[tokio::test]

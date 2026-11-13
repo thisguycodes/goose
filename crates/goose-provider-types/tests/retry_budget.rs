@@ -85,6 +85,21 @@ fn configured_rate_limit_budget_applies_to_every_provider(
     );
 }
 
+#[test]
+fn configured_budget_lowers_but_does_not_extend_a_long_wait() {
+    let long_wait = rate_limited("slow down", Some(Duration::from_secs(600)));
+
+    {
+        let _env = env(Some("1"));
+        assert_eq!(max_retries_for(&long_wait, &RetryConfig::default()), 1);
+    }
+    let _env = env(Some("9"));
+    assert_eq!(
+        max_retries_for(&long_wait, &RetryConfig::default()),
+        DEFAULT_MAX_RETRIES
+    );
+}
+
 #[tokio::test]
 async fn every_retry_of_a_rate_limit_is_announced() {
     let _env = env(None);

@@ -135,18 +135,18 @@ pub fn max_retries_for(error: &ProviderError, config: &RetryConfig) -> usize {
     else {
         return config.max_retries;
     };
+    let configured: Option<usize> = std::env::var(RATE_LIMIT_MAX_RETRIES_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse().ok());
     let details = details.to_lowercase();
     if config.max_retries == 0
         || retry_delay.is_some_and(|delay| delay > MAX_PATIENT_RETRY_DELAY)
         || details.contains("quota")
         || details.contains("billing")
     {
-        return config.max_retries;
+        return configured.map_or(config.max_retries, |max| max.min(config.max_retries));
     }
 
-    let configured = std::env::var(RATE_LIMIT_MAX_RETRIES_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse().ok());
     match configured {
         Some(max_retries) => max_retries,
         None if config.max_retries == DEFAULT_MAX_RETRIES => DEFAULT_RATE_LIMIT_MAX_RETRIES,

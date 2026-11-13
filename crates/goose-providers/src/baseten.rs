@@ -54,14 +54,18 @@ pub fn retry_config() -> RetryConfig {
 /// The chat template only leaves a trailing assistant message open when
 /// `continue_final_message` is set, which in turn requires
 /// `add_generation_prompt` to be off. The Model APIs reference lists only the
-/// latter; if the endpoint rejects the request the response is not resumed.
+/// latter, so the request also asks for `echo`, documented to prepend the last
+/// message when the model is continuing it: a response that does not start
+/// with the prefill was not a continuation and is not used.
 pub fn stream_resume_policy() -> StreamResumePolicy {
     StreamResumePolicy {
         prefill: true,
         prefill_request_params: HashMap::from([
             ("add_generation_prompt".to_string(), json!(false)),
             ("continue_final_message".to_string(), json!(true)),
+            ("echo".to_string(), json!(true)),
         ]),
+        echoes_prefill: true,
         requires_finish_reason: true,
         default_max_tokens: Some(DEFAULT_MAX_TOKENS),
     }

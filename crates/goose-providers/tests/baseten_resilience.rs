@@ -137,9 +137,12 @@ async fn stream_cut_off_mid_answer_is_continued_from_a_prefill() {
     let _settings = settings();
     let server = MockServer::start().await;
     chat_completions()
-        .and(body_partial_json(json!({"continue_final_message": true})))
+        .and(body_partial_json(
+            json!({"continue_final_message": true, "echo": true}),
+        ))
         .respond_with(sse(format!(
-            "{}{}",
+            "{}{}{}",
+            content_chunk("Hello, "),
             content_chunk("world"),
             finished("stop")
         )))
@@ -184,6 +187,52 @@ async fn stream_cut_off_mid_answer_is_continued_from_a_prefill() {
 }
 
 #[tokio::test]
+async fn answer_that_ignores_the_prefill_is_not_spliced_onto_the_partial_one() {
+    let _settings = settings();
+    let server = MockServer::start().await;
+    chat_completions()
+        .and(body_partial_json(json!({"continue_final_message": true})))
+        .respond_with(sse(format!(
+            "{}{}",
+            content_chunk("Hello! How can I help?"),
+            finished("stop")
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    chat_completions()
+        .respond_with(sse(content_chunk("Hello, ")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = Arc::new(AsBaseten(provider_at(&server.uri())));
+
+    let mut stream = stream_resume::stream(
+        provider,
+        &ModelConfig::new(MODEL),
+        "system",
+        &user_prompt(),
+        &[],
+    )
+    .await
+    .unwrap();
+    let mut text = String::new();
+    let mut error = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok((message, _)) => text.extend(message.map(|message| message.as_concat_text())),
+            Err(failure) => error = Some(failure),
+        }
+    }
+
+    assert_eq!(text, "Hello, ");
+    assert!(
+        matches!(error, Some(ProviderError::NetworkError(_))),
+        "the interruption is reported: {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn output_limit_is_continued_with_twice_the_default_budget() {
     let _settings = settings();
     let server = MockServer::start().await;
@@ -191,7 +240,7 @@ async fn output_limit_is_continued_with_twice_the_default_budget() {
         .and(body_partial_json(json!({"max_tokens": 8192})))
         .respond_with(sse(format!(
             "{}{}",
-            content_chunk("part two."),
+            content_chunk("Part one, part two."),
             finished("stop")
         )))
         .expect(1)
