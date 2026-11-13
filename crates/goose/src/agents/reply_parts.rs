@@ -295,7 +295,8 @@ pub(crate) async fn stream_response_from_provider(
     debug!("WAITING_LLM_STREAM_START");
     let stream_result = crate::session_context::with_session_id(
         Some(session_id.clone()),
-        provider.stream(
+        goose_providers::stream_resume::stream(
+            provider.clone(),
             &model_config,
             system_prompt.as_str(),
             messages_for_provider.messages(),
@@ -353,13 +354,26 @@ pub(crate) async fn stream_response_from_provider(
                             .unwrap_or_default()
                             .parse::<bool>()
                             .unwrap_or(false);
+                        goose_providers::retry_notice::notify(
+                            goose_providers::retry_notice::RetryNotice::Retrying {
+                                error: error.clone(),
+                                attempt: attempts,
+                                max_attempts: retry_config.max_retries,
+                                delay: if skip_backoff {
+                                    std::time::Duration::ZERO
+                                } else {
+                                    delay
+                                },
+                            },
+                        );
                         if !skip_backoff {
                             tokio::time::sleep(delay).await;
                         }
 
                         stream = match crate::session_context::with_session_id(
                             Some(session_id.clone()),
-                            provider.stream(
+                            goose_providers::stream_resume::stream(
+                                provider.clone(),
                                 &model_config,
                                 system_prompt.as_str(),
                                 messages_for_provider.messages(),

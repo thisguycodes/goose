@@ -1,6 +1,7 @@
 use crate::base::Provider;
 use crate::errors::ProviderError;
 use crate::maybe_send::MaybeSend;
+use crate::retry_notice::{self, RetryNotice};
 use async_trait::async_trait;
 use std::future::Future;
 use std::time::Duration;
@@ -15,6 +16,8 @@ pub const DEFAULT_MAX_RETRIES: usize = 3;
 pub const DEFAULT_INITIAL_RETRY_INTERVAL_MS: u64 = 1000;
 pub const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
 pub const DEFAULT_MAX_RETRY_INTERVAL_MS: u64 = 30_000;
+pub const DEFAULT_RATE_LIMIT_MAX_RETRIES: usize = 6;
+pub const RATE_LIMIT_MAX_RETRIES_ENV: &str = "GOOSE_PROVIDER_RATE_LIMIT_MAX_RETRIES";
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -116,6 +119,25 @@ pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
     }
 }
 
+/// Rate limits clear on the provider's schedule rather than ours, so they get
+/// more attempts than other transient failures. A config that disables retries
+/// stays disabled.
+pub fn max_retries_for(error: &ProviderError, config: &RetryConfig) -> usize {
+    match error {
+        ProviderError::RateLimitExceeded { .. } if config.max_retries > 0 => {
+            config.max_retries.max(rate_limit_max_retries())
+        }
+        _ => config.max_retries,
+    }
+}
+
+fn rate_limit_max_retries() -> usize {
+    std::env::var(RATE_LIMIT_MAX_RETRIES_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_RATE_LIMIT_MAX_RETRIES)
+}
+
 pub async fn retry_operation<F, Fut, T>(
     config: &RetryConfig,
     operation: F,
@@ -131,12 +153,13 @@ where
         match operation().await {
             Ok(result) => return Ok(result),
             Err(error) => {
-                if should_retry(&error, config) && attempts < config.max_retries {
+                let max_retries = max_retries_for(&error, config);
+                if should_retry(&error, config) && attempts < max_retries {
                     attempts += 1;
                     tracing::warn!(
                         "Request failed, retrying ({}/{}): {:?}",
                         attempts,
-                        config.max_retries,
+                        max_retries,
                         error
                     );
 
@@ -148,6 +171,12 @@ where
                         _ => config.delay_for_attempt(attempts),
                     };
 
+                    retry_notice::notify(RetryNotice::Retrying {
+                        error,
+                        attempt: attempts,
+                        max_attempts: max_retries,
+                        delay,
+                    });
                     sleep(delay).await;
                     continue;
                 }
@@ -232,12 +261,13 @@ impl<P: Provider> ProviderRetry for P {
                         }
                     }
 
-                    if should_retry(&error, &config) && attempts < config.max_retries {
+                    let max_retries = max_retries_for(&error, &config);
+                    if should_retry(&error, &config) && attempts < max_retries {
                         attempts += 1;
                         tracing::warn!(
                             "Request failed, retrying ({}/{}): {:?}",
                             attempts,
-                            config.max_retries,
+                            max_retries,
                             error
                         );
 
@@ -254,6 +284,12 @@ impl<P: Provider> ProviderRetry for P {
                             .parse::<bool>()
                             .unwrap_or(false);
 
+                        retry_notice::notify(RetryNotice::Retrying {
+                            error,
+                            attempt: attempts,
+                            max_attempts: max_retries,
+                            delay: if skip_backoff { Duration::ZERO } else { delay },
+                        });
                         if skip_backoff {
                             tracing::info!("Skipping backoff due to GOOSE_PROVIDER_SKIP_BACKOFF");
                         } else {

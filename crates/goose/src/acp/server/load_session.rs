@@ -391,9 +391,10 @@ impl AcpConnection {
             .await?;
         self.render_stored_recipe_template(&mut session).await?;
 
+        let replay_session = super::notices::session_for_replay(&session, self.notice_channel());
         let replayed_from = replay_conversation_to_client(
             cx,
-            &session,
+            &replay_session,
             self.supports_goose_custom_notifications(),
             self.requests_tool_call_label_enrichment(),
             replay_tail_from_meta(args.meta.as_ref()),

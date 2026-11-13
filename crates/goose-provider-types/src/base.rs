@@ -22,6 +22,7 @@ use crate::{
     model::ModelConfig,
     permission::PermissionConfirmation,
     retry::RetryConfig,
+    stream_resume::StreamResumePolicy,
     thinking::ThinkingEffortSupport,
 };
 
@@ -574,6 +575,11 @@ pub trait Provider: MaybeSend + MaybeSync {
 
     fn retry_config(&self) -> RetryConfig {
         RetryConfig::default()
+    }
+
+    /// How a response for `model_config` that stops part-way can be continued.
+    fn stream_resume_policy(&self, _model_config: &ModelConfig) -> StreamResumePolicy {
+        StreamResumePolicy::default()
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {

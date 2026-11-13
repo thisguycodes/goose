@@ -421,7 +421,9 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 pub fn extract_request_id(headers: &HeaderMap) -> Option<String> {
-    header_value(headers, "request-id").or_else(|| header_value(headers, "x-request-id"))
+    header_value(headers, "request-id")
+        .or_else(|| header_value(headers, "x-baseten-request-id"))
+        .or_else(|| header_value(headers, "x-request-id"))
 }
 
 /// Inverse of [`parse_request_id_suffix`] — change these together.
@@ -481,7 +483,13 @@ async fn handle_status_with_limit(
         let payload = serde_json::from_str::<Value>(&body).ok();
         let request_id = extract_request_id(&headers);
         let err = map_http_error(status, payload.clone(), &url, request_id.as_deref());
-        return Err(apply_retry_after(err, &headers, payload.as_ref()));
+        let err = apply_retry_after(err, &headers, payload.as_ref());
+        return Err(crate::backoff_hints::apply(
+            err,
+            status,
+            &headers,
+            payload.as_ref(),
+        ));
     }
     Ok(response)
 }

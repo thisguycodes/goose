@@ -1120,6 +1120,7 @@ impl StateMachineServices {
         Ok(Box::pin(
             async_stream::try_stream! {
                 let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+                let retry_notices = tx.clone();
                 let emit = Emitter::new(tx, cancel.clone());
                 let result = {
                     let run = crate::session_context::with_session_id(
@@ -1132,6 +1133,7 @@ impl StateMachineServices {
                             &emit,
                         ),
                     );
+                    let run = super::retry_notifications::forward_to(retry_notices, run);
                     tokio::pin!(run);
                     loop {
                         tokio::select! {

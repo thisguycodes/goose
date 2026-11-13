@@ -7,6 +7,8 @@ compile_error!("feature `live-websocket` requires either `rustls-tls` or `native
 pub mod anthropic;
 pub mod api_client;
 pub mod azure_foundry;
+mod backoff_hints;
+pub mod baseten;
 pub mod databricks;
 pub mod databricks_auth;
 pub mod databricks_v2;
@@ -16,6 +18,7 @@ pub use goose_provider_types::{
     base, cache_semantics, canonical, context_limit, conversation, documents, errors, formats,
     goose_mode, images, json, model, permission, request_log, retry, thinking, utils,
 };
+pub use goose_provider_types::{retry_notice, stream_resume};
 pub mod browser_live_transport;
 pub mod declarative;
 pub mod http_status;

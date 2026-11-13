@@ -116,6 +116,7 @@ pub use crate::live_voice::LiveVoiceService;
 mod manage_sessions;
 mod message_meta;
 mod new_session;
+mod notices;
 mod onboarding;
 mod prompts;
 mod providers;
@@ -318,6 +319,7 @@ pub struct AcpConnection {
     connection_id: u64,
     client_supports_acp_elicitation: OnceCell<bool>,
     client_supports_goose_custom_notifications: OnceCell<bool>,
+    client_supports_session_notices: OnceCell<bool>,
     client_supports_recipe_param_requests: OnceCell<bool>,
     client_requests_tool_call_label_enrichment: OnceCell<bool>,
     client_cx: OnceCell<ConnectionTo<Client>>,
@@ -998,6 +1000,7 @@ impl AcpConnection {
             connection_id: NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             client_supports_acp_elicitation: OnceCell::new(),
             client_supports_goose_custom_notifications: OnceCell::new(),
+            client_supports_session_notices: OnceCell::new(),
             client_supports_recipe_param_requests: OnceCell::new(),
             client_requests_tool_call_label_enrichment: OnceCell::new(),
             client_cx: OnceCell::new(),
@@ -1425,6 +1428,14 @@ impl AcpConnection {
                 cx.send_notification(SessionNotification::new(session_id.clone(), update))?;
             }
             MessageContent::SystemNotification(notification) => {
+                if notices::send_system_notification(
+                    cx,
+                    self.notice_channel(),
+                    session_id,
+                    notification,
+                )? {
+                    return Ok(());
+                }
                 send_status_message_update(
                     cx,
                     self.supports_goose_custom_notifications(),
@@ -1433,6 +1444,9 @@ impl AcpConnection {
                 )?;
             }
             MessageContent::Error(error) => {
+                if notices::send_error(cx, self.notice_channel(), session_id, error)? {
+                    return Ok(());
+                }
                 let chunk = content_chunk_for_message(
                     message,
                     ContentBlock::Text(TextContent::new(error.message.clone())),
@@ -1765,6 +1779,9 @@ impl AcpConnection {
         let _ = self.client_supports_goose_custom_notifications.set(
             extract_client_supports_goose_custom_notifications(goose_client_capabilities.as_ref()),
         );
+        let _ = self
+            .client_supports_session_notices
+            .set(notices::client_supports_session_notices(&args));
         let _ = self.client_supports_recipe_param_requests.set(
             extract_client_supports_recipe_param_requests(goose_client_capabilities.as_ref()),
         );
@@ -2100,7 +2117,14 @@ impl AcpConnection {
                             .data(format!("Session not found: {session_id}")));
                     }
 
-                    populate_output_token_limit_content(&mut message);
+                    if !notices::send_output_limit(
+                        cx,
+                        self.notice_channel(),
+                        acp_session_id,
+                        &message,
+                    )? {
+                        populate_output_token_limit_content(&mut message);
+                    }
                     last_message_was_error = message.error_kind().is_some();
                     for content_item in &message.content {
                         if let MessageContent::ToolRequest(tool_request) = content_item {

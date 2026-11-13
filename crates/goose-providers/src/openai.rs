@@ -855,6 +855,28 @@ impl Provider for OpenAiProvider {
         ))
     }
 
+    fn retry_config(&self) -> crate::retry::RetryConfig {
+        if crate::baseten::is_baseten_url(self.api_client.host()) {
+            crate::baseten::retry_config()
+        } else {
+            crate::retry::RetryConfig::default()
+        }
+    }
+
+    fn stream_resume_policy(
+        &self,
+        model_config: &ModelConfig,
+    ) -> crate::stream_resume::StreamResumePolicy {
+        // The Responses API reports a cut-off stream itself and takes no prefill.
+        if crate::baseten::is_baseten_url(self.api_client.host())
+            && !self.should_use_responses_api_for_provider(&model_config.model_name)
+        {
+            crate::baseten::stream_resume_policy()
+        } else {
+            crate::stream_resume::StreamResumePolicy::default()
+        }
+    }
+
     async fn stream(
         &self,
         model_config: &ModelConfig,

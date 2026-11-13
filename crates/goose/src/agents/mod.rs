@@ -17,6 +17,7 @@ pub mod prompt_manager;
 pub mod provider_manager;
 pub mod reply_parts;
 pub mod retry;
+mod retry_notifications;
 #[cfg(feature = "scheduler")]
 mod schedule_tool;
 mod services;
