@@ -101,6 +101,25 @@ fn configured_budget_lowers_but_does_not_extend_a_long_wait() {
 }
 
 #[tokio::test]
+async fn budget_counts_every_retry_so_far_whatever_failed() {
+    let _env = env(None);
+    let calls = AtomicUsize::new(0);
+    let config = without_backoff(DEFAULT_MAX_RETRIES);
+
+    let result: Result<(), ProviderError> = retry_operation(&config, || async {
+        match calls.fetch_add(1, Ordering::SeqCst) {
+            0..=2 => Err(rate_limited("slow down", None)),
+            _ => Err(ProviderError::ServerError("boom".into())),
+        }
+    })
+    .await;
+
+    // Three rate-limit retries have used up what a server error is allowed.
+    assert_eq!(result, Err(ProviderError::ServerError("boom".into())));
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
 async fn every_retry_of_a_rate_limit_is_announced() {
     let _env = env(None);
     let calls = AtomicUsize::new(0);

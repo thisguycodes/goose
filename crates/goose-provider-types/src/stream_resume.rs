@@ -48,8 +48,10 @@ const INCOMPLETE_STREAM_ERROR: &str =
 pub struct StreamResumePolicy {
     /// The provider continues a trailing assistant message rather than answering it.
     pub prefill: bool,
-    /// Request parameters that make the provider continue the prefill.
-    pub prefill_request_params: HashMap<String, Value>,
+    /// Request parameters that make the provider continue the prefill. Servers
+    /// differ in which they accept, so each set is tried in turn until one is
+    /// not rejected.
+    pub prefill_request_params: Vec<HashMap<String, Value>>,
     /// Those parameters also make the provider repeat the prefill ahead of the
     /// continuation. The repeat is checked and removed, so output that does not
     /// start with the prefill is recognised as a fresh answer and discarded.
@@ -127,6 +129,9 @@ struct Delivered {
     yielded: bool,
     content: bool,
     text: String,
+    /// Unsigned reasoning, sent back with the prefill so the continuation sees
+    /// the turn as the model left it.
+    thinking: String,
     tool_request: bool,
     /// Id of the message the text belongs to; continuations reuse it so their
     /// chunks extend that message instead of starting a second one.
@@ -147,6 +152,9 @@ impl Delivered {
                         self.anchor_id = message.id.clone();
                     }
                     self.text.push_str(&text.text);
+                }
+                MessageContent::Thinking(thinking) if thinking.signature.is_empty() => {
+                    self.thinking.push_str(&thinking.thinking);
                 }
                 MessageContent::ToolRequest(_) => self.tool_request = true,
                 _ => {}
@@ -237,7 +245,7 @@ fn effective_policy(
     }
     if let Some(params) = configured_prefill_params() {
         policy.echoes_prefill = params.get("echo") == Some(&Value::Bool(true));
-        policy.prefill_request_params = params;
+        policy.prefill_request_params = vec![params];
     }
     Some(policy)
 }
@@ -279,11 +287,14 @@ struct Request {
 }
 
 impl Request {
+    /// Asks for the rest of the response. `accepted_params` remembers which
+    /// prefill parameters the provider took, so later continuations start there.
     async fn continuation(
         &self,
         max_tokens: Option<i32>,
         delivered: &Delivered,
         policy: &StreamResumePolicy,
+        accepted_params: &mut usize,
     ) -> Result<MessageStream, ProviderError> {
         let mut model_config = self.model_config.clone();
         model_config.max_tokens = max_tokens;
@@ -294,13 +305,28 @@ impl Request {
                 .await;
         }
 
-        let model_config =
-            model_config.with_merged_request_params(policy.prefill_request_params.clone());
+        let mut prefill = Message::assistant();
+        if !delivered.thinking.is_empty() {
+            prefill = prefill.with_content(MessageContent::thinking(&delivered.thinking, ""));
+        }
         let mut messages = self.messages.clone();
-        messages.push(Message::assistant().with_text(&delivered.text));
-        self.provider
-            .stream(&model_config, &self.system, &messages, &self.tools)
-            .await
+        messages.push(prefill.with_text(&delivered.text));
+        loop {
+            let params = policy.prefill_request_params.get(*accepted_params);
+            let model_config = model_config
+                .clone()
+                .with_merged_request_params(params.cloned().unwrap_or_default());
+            let result = self
+                .provider
+                .stream(&model_config, &self.system, &messages, &self.tools)
+                .await;
+            let rejected = matches!(result, Err(ProviderError::RequestFailed(_)));
+            if rejected && *accepted_params + 1 < policy.prefill_request_params.len() {
+                *accepted_params += 1;
+                continue;
+            }
+            return result;
+        }
     }
 }
 
@@ -340,6 +366,7 @@ pub async fn stream(
         let mut max_tokens = request.model_config.max_tokens;
         let mut continuing: Option<Continuing> = None;
         let mut echo: Option<EchoCheck> = None;
+        let mut accepted_params = 0;
 
         loop {
             let mut finish_seen = false;
@@ -507,7 +534,10 @@ pub async fn stream(
                 delivered.yielded = true;
                 yield (None, None);
             }
-            stream = match request.continuation(max_tokens, &delivered, &policy).await {
+            let continuation = request
+                .continuation(max_tokens, &delivered, &policy, &mut accepted_params)
+                .await;
+            stream = match continuation {
                 Ok(stream) => stream,
                 Err(continuation_error) => {
                     tracing::warn!(
@@ -626,10 +656,10 @@ mod tests {
     fn prefill_policy() -> StreamResumePolicy {
         StreamResumePolicy {
             prefill: true,
-            prefill_request_params: HashMap::from([(
+            prefill_request_params: vec![HashMap::from([(
                 "add_generation_prompt".to_string(),
                 json!(false),
-            )]),
+            )])],
             echoes_prefill: false,
             requires_finish_reason: true,
             default_max_tokens: Some(4096),
@@ -731,6 +761,10 @@ mod tests {
 
     async fn run(provider: &Arc<ScriptedProvider>) -> Outcome {
         let _settings = settings();
+        collect(provider).await
+    }
+
+    async fn collect(provider: &Arc<ScriptedProvider>) -> Outcome {
         let mut outcome = Outcome {
             messages: Vec::new(),
             error: None,
@@ -1023,6 +1057,179 @@ mod tests {
             Some(Err(ProviderError::NetworkError(_)))
         ));
         assert_eq!(provider.call_count(), 1 + DEFAULT_MAX_STREAM_RESUMES);
+    }
+
+    #[tokio::test]
+    async fn rejected_prefill_parameters_fall_back_to_the_next_set() {
+        let mut policy = prefill_policy();
+        policy.prefill_request_params.insert(
+            0,
+            HashMap::from([("continue_final_message".to_string(), json!(true))]),
+        );
+        let provider = ScriptedProvider::new(
+            policy,
+            vec![
+                Ok(vec![text("first", "One, "), Err(connection_reset())]),
+                Err(ProviderError::RequestFailed(
+                    "Bad request (400)".to_string(),
+                )),
+                Ok(vec![text("second", "two, "), Err(connection_reset())]),
+                Ok(vec![text("third", "three."), finished("stop")]),
+            ],
+        );
+
+        let outcome = run(&provider).await;
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.text(), "One, two, three.");
+        let calls = provider.calls.lock().unwrap();
+        let sent = |call: usize, param: &str| {
+            calls[call]
+                .request_params
+                .as_ref()
+                .is_some_and(|params| params.contains_key(param))
+        };
+        assert!(sent(1, "continue_final_message"));
+        assert!(!sent(2, "continue_final_message"));
+        assert!(sent(2, "add_generation_prompt"));
+        assert!(
+            !sent(3, "continue_final_message"),
+            "the rejected parameters are not offered again"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_already_delivered_is_sent_back_with_the_prefill() {
+        let provider = ScriptedProvider::new(
+            prefill_policy(),
+            vec![
+                Ok(vec![
+                    thinking("first", "Considering."),
+                    text("first", "Hello, "),
+                    Err(connection_reset()),
+                ]),
+                Ok(vec![text("second", "world"), finished("stop")]),
+            ],
+        );
+
+        let outcome = run(&provider).await;
+
+        assert_eq!(outcome.text(), "Hello, world");
+        let calls = provider.calls.lock().unwrap();
+        let prefill = calls[1].messages.last().unwrap();
+        assert!(matches!(
+            prefill.content.as_slice(),
+            [MessageContent::Thinking(thinking), MessageContent::Text(text)]
+                if thinking.thinking == "Considering." && text.text == "Hello, "
+        ));
+    }
+
+    #[tokio::test]
+    async fn usage_of_each_request_reaches_the_caller_unchanged() {
+        let usage = |output_tokens| {
+            let usage = ProviderUsage::new(
+                "model".to_string(),
+                Usage::new(Some(10), Some(output_tokens), None),
+            )
+            .with_finish_reasons(vec!["length".to_string()]);
+            Ok((None, Some(usage)))
+        };
+        let provider = ScriptedProvider::new(
+            prefill_policy(),
+            vec![
+                Ok(vec![
+                    text("first", "Part one, "),
+                    limit_marker("first"),
+                    usage(4096),
+                ]),
+                Ok(vec![text("second", "part two."), usage(7)]),
+            ],
+        );
+        let _settings = settings();
+
+        let stream = stream(
+            provider,
+            &ModelConfig::new("model"),
+            "system",
+            &[Message::user().with_text("hello")],
+            &[],
+        )
+        .await
+        .unwrap();
+        let output_tokens: Vec<_> = stream
+            .filter_map(|item| async move { item.ok()?.1?.usage.output_tokens })
+            .collect()
+            .await;
+
+        // The caller keeps the last one, so a continued response reports the
+        // final request only.
+        assert_eq!(output_tokens, vec![4096, 7]);
+    }
+
+    async fn run_with(
+        settings: &[(&'static str, Option<&'static str>)],
+        provider: &Arc<ScriptedProvider>,
+    ) -> Outcome {
+        let _settings = env_lock::lock_env(settings.iter().copied());
+        collect(provider).await
+    }
+
+    fn interrupted_then_finished(policy: StreamResumePolicy) -> Arc<ScriptedProvider> {
+        ScriptedProvider::new(
+            policy,
+            vec![
+                Ok(vec![text("first", "Hello, "), Err(connection_reset())]),
+                Ok(vec![text("second", "world"), finished("stop")]),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn resume_can_be_switched_off() {
+        let provider = interrupted_then_finished(prefill_policy());
+
+        let outcome = run_with(&[(STREAM_RESUME_ENV, Some("off"))], &provider).await;
+
+        assert_eq!(outcome.error, Some(connection_reset()));
+        assert_eq!(provider.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn prefill_can_be_switched_on_for_a_provider_without_a_policy() {
+        let provider = interrupted_then_finished(StreamResumePolicy::default());
+
+        let outcome = run_with(&[(STREAM_RESUME_ENV, Some("prefill"))], &provider).await;
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.text(), "Hello, world");
+    }
+
+    #[tokio::test]
+    async fn configured_parameters_replace_the_providers() {
+        let provider = interrupted_then_finished(prefill_policy());
+
+        let outcome = run_with(
+            &[(STREAM_RESUME_PARAMS_ENV, Some(r#"{"prefix": true}"#))],
+            &provider,
+        )
+        .await;
+
+        assert_eq!(outcome.text(), "Hello, world");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(
+            calls[1].request_params,
+            Some(HashMap::from([("prefix".to_string(), json!(true))]))
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_limit_of_zero_never_resumes() {
+        let provider = interrupted_then_finished(prefill_policy());
+
+        let outcome = run_with(&[(MAX_STREAM_RESUMES_ENV, Some("0"))], &provider).await;
+
+        assert_eq!(outcome.error, Some(connection_reset()));
+        assert_eq!(provider.call_count(), 1);
     }
 
     fn echoing_policy() -> StreamResumePolicy {

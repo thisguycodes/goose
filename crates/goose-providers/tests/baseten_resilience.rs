@@ -7,7 +7,7 @@ use goose_providers::{
     api_client::{ApiClient, AuthMethod},
     base::{MessageStream, Provider},
     baseten,
-    conversation::message::Message,
+    conversation::message::{Message, MessageContent},
     errors::ProviderError,
     model::ModelConfig,
     openai::{OpenAiProvider, OpenAiProviderBuilder},
@@ -233,6 +233,183 @@ async fn answer_that_ignores_the_prefill_is_not_spliced_onto_the_partial_one() {
 }
 
 #[tokio::test]
+async fn documented_parameters_are_tried_when_the_explicit_ones_are_rejected() {
+    let _settings = settings();
+    let server = MockServer::start().await;
+    chat_completions()
+        .and(body_partial_json(json!({"continue_final_message": true})))
+        .respond_with(
+            ResponseTemplate::new(422)
+                .set_body_json(json!({"error": {"message": "Extra inputs are not permitted"}})),
+        )
+        .mount(&server)
+        .await;
+    chat_completions()
+        .and(body_partial_json(
+            json!({"add_generation_prompt": false, "echo": true}),
+        ))
+        .respond_with(sse(format!(
+            "{}{}{}",
+            content_chunk("Hello, "),
+            content_chunk("world"),
+            finished("stop")
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    chat_completions()
+        .respond_with(sse(content_chunk("Hello, ")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = Arc::new(AsBaseten(provider_at(&server.uri())));
+
+    let stream = stream_resume::stream(
+        provider,
+        &ModelConfig::new(MODEL),
+        "system",
+        &user_prompt(),
+        &[],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(collect_text(stream).await.unwrap(), "Hello, world");
+}
+
+fn tool_call_chunk(delta: Value, finish_reason: Option<&str>, usage: bool) -> String {
+    let mut chunk = json!({"id": "chatcmpl-1", "model": MODEL,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]});
+    if usage {
+        chunk["usage"] = usage_json();
+    }
+    format!("data: {chunk}\n\n")
+}
+
+fn usage_json() -> Value {
+    json!({"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30})
+}
+
+fn tool_call_start(usage: bool) -> String {
+    let delta = json!({"role": "assistant", "tool_calls": [{"index": 0, "id": "call_1",
+        "type": "function", "function": {"name": "shell", "arguments": ""}}]});
+    tool_call_chunk(delta, None, usage)
+}
+
+fn tool_call_arguments(arguments: &str, usage: bool) -> String {
+    let delta = json!({"tool_calls": [{"index": 0, "function": {"arguments": arguments}}]});
+    tool_call_chunk(delta, None, usage)
+}
+
+/// How a server reports usage decides which item carries the finish reason.
+enum UsageStyle {
+    FinalChunk,
+    EveryChunk,
+    Never,
+}
+
+fn complete_tool_call(style: UsageStyle) -> String {
+    let every = matches!(style, UsageStyle::EveryChunk);
+    let mut body = format!(
+        "{}{}{}{}",
+        tool_call_start(every),
+        tool_call_arguments("{\"command\":", every),
+        tool_call_arguments("\"ls\"}", every),
+        tool_call_chunk(json!({}), Some("tool_calls"), every)
+    );
+    if matches!(style, UsageStyle::FinalChunk) {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            json!({"id": "chatcmpl-1", "model": MODEL, "choices": [], "usage": usage_json()})
+        ));
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// The arguments of every tool call the stream delivers, or the error it ends on.
+async fn collect_tool_calls(mut stream: MessageStream) -> Result<Vec<Value>, ProviderError> {
+    let mut calls = Vec::new();
+    while let Some(item) = stream.next().await {
+        let (message, _) = item?;
+        for content in message.iter().flat_map(|message| &message.content) {
+            if let MessageContent::ToolRequest(request) = content {
+                let call = request.tool_call.as_ref().expect("a usable tool call");
+                calls.push(json!(call.arguments));
+            }
+        }
+    }
+    Ok(calls)
+}
+
+#[test_case::test_case(UsageStyle::FinalChunk ; "usage in a final chunk")]
+#[test_case::test_case(UsageStyle::EveryChunk ; "usage on every chunk")]
+#[test_case::test_case(UsageStyle::Never ; "no usage")]
+#[tokio::test]
+async fn complete_tool_call_is_delivered_once(style: UsageStyle) {
+    let _settings = settings();
+    let server = MockServer::start().await;
+    chat_completions()
+        .respond_with(sse(complete_tool_call(style)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = Arc::new(AsBaseten(provider_at(&server.uri())));
+
+    let stream = stream_resume::stream(
+        provider,
+        &ModelConfig::new(MODEL),
+        "system",
+        &user_prompt(),
+        &[],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        collect_tool_calls(stream).await.unwrap(),
+        vec![json!({"command": "ls"})]
+    );
+}
+
+#[tokio::test]
+async fn tool_call_cut_off_mid_arguments_is_requested_again_rather_than_run() {
+    let _settings = settings();
+    let server = MockServer::start().await;
+    chat_completions()
+        .respond_with(sse(format!(
+            "{}{}",
+            tool_call_start(false),
+            tool_call_arguments("{\"command\":", false)
+        )))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    chat_completions()
+        .respond_with(sse(complete_tool_call(UsageStyle::FinalChunk)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = Arc::new(AsBaseten(provider_at(&server.uri())));
+
+    let stream = stream_resume::stream(
+        provider,
+        &ModelConfig::new(MODEL),
+        "system",
+        &user_prompt(),
+        &[],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        collect_tool_calls(stream).await.unwrap(),
+        vec![json!({"command": "ls"})]
+    );
+}
+
+#[tokio::test]
 async fn output_limit_is_continued_with_twice_the_default_budget() {
     let _settings = settings();
     let server = MockServer::start().await;
@@ -273,7 +450,7 @@ async fn output_limit_is_continued_with_twice_the_default_budget() {
 }
 
 #[tokio::test]
-async fn overloaded_response_is_retried_after_the_wait_it_asks_for() {
+async fn overloaded_response_is_retried_and_carries_the_wait_it_asks_for() {
     let _settings = settings();
     let server = MockServer::start().await;
     chat_completions()

@@ -103,6 +103,21 @@ fn answer_cut_off_by_a_stream_error(text: &str) -> ResponseTemplate {
     ))
 }
 
+fn answer_stopped_by_the_output_limit(text: &str) -> ResponseTemplate {
+    sse(format!(
+        "{}{}data: [DONE]\n\n",
+        chunk(json!({"content": text}), None),
+        chunk(json!({}), Some("length"))
+    ))
+}
+
+fn failure_before_any_content() -> ResponseTemplate {
+    sse(format!(
+        "data: {}\n\n",
+        json!({"error": {"message": "upstream exploded"}})
+    ))
+}
+
 fn output_limit_before_any_content() -> ResponseTemplate {
     sse(format!(
         "{}data: [DONE]\n\n",
@@ -361,6 +376,57 @@ fn interrupted_response_is_resumed_and_announced() {
         assert_eq!(
             requests[1]["messages"].as_array().unwrap().last().unwrap(),
             &json!({"role": "assistant", "content": "Hello, "})
+        );
+    });
+}
+
+#[test]
+fn stream_that_fails_before_any_content_is_retried_and_announced() {
+    let _settings = settings(&[]);
+    run_test(async {
+        let backend = Backend::start(vec![failure_before_any_content(), answer("Hello")]).await;
+        let client = TestClient::connect(&backend, session_notices()).await;
+
+        let (response, received) = client.prompt().await;
+
+        assert_eq!(response.unwrap().stop_reason, StopReason::EndTurn);
+        assert_eq!(received.agent_text(), "Hello");
+        assert_eq!(
+            received.notices(),
+            vec![(
+                NoticeSeverity::Info,
+                "Server error: upstream exploded. Retrying in under a second (attempt 1 of 3)."
+                    .to_string(),
+                None
+            )]
+        );
+    });
+}
+
+#[test]
+fn response_that_hits_the_output_limit_is_continued_and_announced() {
+    let _settings = settings(&[("GOOSE_PROVIDER_STREAM_RESUME", Some("prefill"))]);
+    run_test(async {
+        let backend = Backend::start(vec![
+            answer_stopped_by_the_output_limit("Part one, "),
+            answer("part two."),
+        ])
+        .await;
+        let client = TestClient::connect(&backend, session_notices()).await;
+
+        let (response, received) = client.prompt().await;
+
+        assert_eq!(response.unwrap().stop_reason, StopReason::EndTurn);
+        assert_eq!(received.agent_text(), "Part one, part two.");
+        assert_eq!(
+            received.notices(),
+            vec![(
+                NoticeSeverity::Info,
+                "The model reached its output-token limit. Continuing the response \
+                 (attempt 1 of 3)."
+                    .to_string(),
+                None
+            )]
         );
     });
 }
