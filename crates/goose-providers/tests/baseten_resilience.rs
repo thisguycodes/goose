@@ -100,9 +100,17 @@ fn user_prompt() -> Vec<Message> {
     vec![Message::user().with_text("Say hello")]
 }
 
-/// Retries are under test, not the time spent waiting between them.
-fn skip_backoff() {
-    std::env::set_var("GOOSE_PROVIDER_SKIP_BACKOFF", "true");
+/// Pins the settings these tests depend on, whatever the developer's shell has
+/// exported, for as long as the guard lives.
+fn settings() -> env_lock::EnvGuard<'static> {
+    env_lock::lock_env([
+        // Retries are under test, not the time spent waiting between them.
+        ("GOOSE_PROVIDER_SKIP_BACKOFF", Some("true")),
+        ("GOOSE_PROVIDER_RATE_LIMIT_MAX_RETRIES", None),
+        ("GOOSE_PROVIDER_MAX_STREAM_RESUMES", None),
+        ("GOOSE_PROVIDER_STREAM_RESUME_PARAMS", None),
+        ("GOOSE_PROVIDER_STREAM_RESUME", None),
+    ])
 }
 
 fn recording_observer() -> (RetryObserver, Arc<Mutex<Vec<RetryNotice>>>) {
@@ -126,6 +134,7 @@ async fn request_bodies(server: &MockServer) -> Vec<Value> {
 
 #[tokio::test]
 async fn stream_cut_off_mid_answer_is_continued_from_a_prefill() {
+    let _settings = settings();
     let server = MockServer::start().await;
     chat_completions()
         .and(body_partial_json(json!({"continue_final_message": true})))
@@ -176,6 +185,7 @@ async fn stream_cut_off_mid_answer_is_continued_from_a_prefill() {
 
 #[tokio::test]
 async fn output_limit_is_continued_with_twice_the_default_budget() {
+    let _settings = settings();
     let server = MockServer::start().await;
     chat_completions()
         .and(body_partial_json(json!({"max_tokens": 8192})))
@@ -215,7 +225,7 @@ async fn output_limit_is_continued_with_twice_the_default_budget() {
 
 #[tokio::test]
 async fn overloaded_response_is_retried_after_the_wait_it_asks_for() {
-    skip_backoff();
+    let _settings = settings();
     let server = MockServer::start().await;
     chat_completions()
         .respond_with(
@@ -276,7 +286,7 @@ async fn overloaded_response_is_retried_after_the_wait_it_asks_for() {
 
 #[tokio::test]
 async fn rate_limit_notice_names_the_limit_that_ran_out() {
-    skip_backoff();
+    let _settings = settings();
     let server = MockServer::start().await;
     chat_completions()
         .respond_with(

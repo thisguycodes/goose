@@ -1,11 +1,10 @@
 //! Shows errors and status to the user without making them conversation content.
 //!
 //! An ACP session notice is advisory and live-only, and the client says at
-//! initialize whether it can present one. goose's own clients take a status
-//! message instead. A client that offers neither still gets the text as an agent
-//! message, which is the fallback the protocol gives agents.
-
-use std::borrow::Cow;
+//! initialize whether it can present one. A client that does not still gets an
+//! error as an agent message, which is the fallback the protocol gives agents
+//! and what goose's own clients are built around; `GOOSE_ACP_ERRORS_AS_MESSAGES`
+//! turns that fallback off.
 
 use agent_client_protocol::schema::v1::{
     InitializeRequest, Notice, NoticeSeverity, SessionId, SessionNotification, SessionUpdate,
@@ -19,11 +18,15 @@ use crate::acp::custom_notifications::{
 use crate::conversation::message::{
     ErrorContent, Message, MessageContent, SystemNotificationContent, SystemNotificationType,
 };
-use crate::conversation::Conversation;
-use crate::session::Session;
+
+pub(super) const ERRORS_AS_MESSAGES_ENV: &str = "GOOSE_ACP_ERRORS_AS_MESSAGES";
 
 const OUTPUT_LIMIT_TITLE: &str = "The model reached its output-token limit";
 const OUTPUT_LIMIT_DESCRIPTION: &str = "The response stopped early and may be incomplete.";
+
+/// A notice title has to stand alone; a provider error can carry a whole
+/// response body.
+const MAX_TITLE_CHARS: usize = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NoticeChannel {
@@ -59,16 +62,28 @@ impl AcpConnection {
     }
 }
 
-/// A notice needs a title that stands alone; goose's error text leads with one
-/// and follows with guidance.
+fn errors_as_messages() -> bool {
+    !std::env::var(ERRORS_AS_MESSAGES_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "off"
+        )
+    })
+}
+
+/// goose's error text leads with what happened and follows with guidance, which
+/// is the split a notice wants.
 fn notice(severity: NoticeSeverity, text: &str) -> Notice {
     let text = text.trim();
-    match text.split_once("\n\n") {
-        Some((title, description)) if !title.trim().is_empty() => {
-            Notice::new(severity, title.trim()).description(description.trim().to_string())
-        }
-        _ => Notice::new(severity, text),
+    let (title, description) = match text.split_once("\n\n") {
+        Some((title, description)) => (title.trim(), Some(description.trim())),
+        None => (text, None),
+    };
+    if title.chars().count() <= MAX_TITLE_CHARS {
+        return Notice::new(severity, title).description(description.map(str::to_string));
     }
+    let shortened: String = title.chars().take(MAX_TITLE_CHARS).collect();
+    Notice::new(severity, format!("{}…", shortened.trim_end())).description(text.to_string())
 }
 
 fn send_session_notice(
@@ -82,8 +97,8 @@ fn send_session_notice(
     ))
 }
 
-/// Returns whether the client was told, so the caller knows not to fall back to
-/// an agent message.
+/// Returns whether the error has been dealt with, so the caller knows not to
+/// send it as an agent message.
 pub(super) fn send_error(
     cx: &ConnectionTo<Client>,
     channel: NoticeChannel,
@@ -98,6 +113,7 @@ pub(super) fn send_error(
                 notice(NoticeSeverity::Error, &error.message),
             )?;
         }
+        _ if errors_as_messages() => return Ok(false),
         NoticeChannel::GooseStatus => {
             cx.send_notification(GooseSessionNotification {
                 session_id: session_id.0.to_string(),
@@ -108,7 +124,8 @@ pub(super) fn send_error(
                 }),
             })?;
         }
-        NoticeChannel::Unsupported => return Ok(false),
+        // The prompt's own error response still reports a failed turn.
+        NoticeChannel::Unsupported => {}
     }
     Ok(true)
 }
@@ -141,61 +158,45 @@ fn is_output_limit_marker(message: &Message) -> bool {
         && message.metadata.output_token_limit_reached
 }
 
-/// Returns whether a notice replaced the text that otherwise stands in for a
-/// response cut off before it produced any content.
+/// Returns whether the text that otherwise stands in for a response cut off
+/// before it produced any content should be left out. goose's own clients read
+/// the limit from that message's metadata, so they always get it.
 pub(super) fn send_output_limit(
     cx: &ConnectionTo<Client>,
     channel: NoticeChannel,
     session_id: &SessionId,
     message: &Message,
 ) -> Result<bool, agent_client_protocol::Error> {
-    if channel != NoticeChannel::Session || !is_output_limit_marker(message) {
+    if !is_output_limit_marker(message) {
         return Ok(false);
     }
-    send_session_notice(
-        cx,
-        session_id,
-        Notice::new(NoticeSeverity::Warning, OUTPUT_LIMIT_TITLE)
-            .description(OUTPUT_LIMIT_DESCRIPTION.to_string()),
-    )?;
-    Ok(true)
-}
-
-/// Notices are live events, not history: a client that was shown an error as a
-/// notice does not get it back as an agent message when the session is loaded.
-fn history_for_replay(conversation: &Conversation, channel: NoticeChannel) -> Option<Conversation> {
-    let was_notice = |message: &Message| {
-        message.error().is_some()
-            || (channel == NoticeChannel::Session && is_output_limit_marker(message))
-    };
-    if channel == NoticeChannel::Unsupported || !conversation.messages().iter().any(was_notice) {
-        return None;
-    }
-
-    let mut conversation = conversation.clone();
-    for message in conversation.messages_mut() {
-        message
-            .content
-            .retain(|content| !matches!(content, MessageContent::Error(_)));
-        if channel == NoticeChannel::Session && is_output_limit_marker(message) {
-            message.metadata.output_token_limit_reached = false;
+    match channel {
+        NoticeChannel::Session => {
+            send_session_notice(
+                cx,
+                session_id,
+                Notice::new(NoticeSeverity::Warning, OUTPUT_LIMIT_TITLE)
+                    .description(OUTPUT_LIMIT_DESCRIPTION.to_string()),
+            )?;
+            Ok(true)
         }
+        // The prompt's stop reason still reports the limit.
+        NoticeChannel::Unsupported => Ok(!errors_as_messages()),
+        NoticeChannel::GooseStatus => Ok(false),
     }
-    Some(conversation)
 }
 
-pub(super) fn session_for_replay(session: &Session, channel: NoticeChannel) -> Cow<'_, Session> {
-    let history = session
-        .conversation
-        .as_ref()
-        .and_then(|conversation| history_for_replay(conversation, channel));
-    match history {
-        Some(conversation) => Cow::Owned(Session {
-            conversation: Some(conversation),
-            ..session.clone()
-        }),
-        None => Cow::Borrowed(session),
-    }
+/// Whether `message` only reports status. Such a message arrives at any point
+/// in a turn and says nothing about how the turn went.
+pub(super) fn is_status_only(message: &Message) -> bool {
+    !message.content.is_empty()
+        && message.content.iter().all(|content| {
+            matches!(
+                content,
+                MessageContent::SystemNotification(notification)
+                    if notification.notification_type != SystemNotificationType::CreditsExhausted
+            )
+        })
 }
 
 #[cfg(test)]
@@ -216,14 +217,6 @@ mod tests {
         let mut marker = Message::assistant();
         marker.metadata.output_token_limit_reached = true;
         marker
-    }
-
-    fn failed_turn() -> Conversation {
-        Conversation::new_unvalidated(vec![
-            Message::user().with_text("hello"),
-            Message::assistant().with_error(MessageErrorKind::Other, "provider failed"),
-            output_limit_marker(),
-        ])
     }
 
     #[test]
@@ -266,29 +259,14 @@ mod tests {
     }
 
     #[test]
-    fn replay_keeps_errors_for_a_client_that_was_sent_them_as_messages() {
-        assert!(history_for_replay(&failed_turn(), NoticeChannel::Unsupported).is_none());
-    }
+    fn overlong_title_is_shortened_and_kept_whole_in_the_description() {
+        let text = format!("Server error: {}\n\nPlease retry.", "é".repeat(1_000));
 
-    #[test]
-    fn replay_is_untouched_when_nothing_was_shown_as_a_notice() {
-        let conversation = Conversation::new_unvalidated(vec![Message::user().with_text("hello")]);
+        let notice = notice(NoticeSeverity::Error, &text);
 
-        assert!(history_for_replay(&conversation, NoticeChannel::Session).is_none());
-    }
-
-    #[test]
-    fn replay_drops_errors_that_were_shown_as_notices() {
-        let goose = history_for_replay(&failed_turn(), NoticeChannel::GooseStatus).unwrap();
-        assert!(goose.messages()[1].content.is_empty());
-        assert!(
-            goose.messages()[2].metadata.output_token_limit_reached,
-            "goose clients read the limit from the replayed message"
-        );
-
-        let standard = history_for_replay(&failed_turn(), NoticeChannel::Session).unwrap();
-        assert!(standard.messages()[1].content.is_empty());
-        assert!(!standard.messages()[2].metadata.output_token_limit_reached);
+        assert_eq!(notice.title.chars().count(), MAX_TITLE_CHARS + 1);
+        assert!(notice.title.ends_with('…'));
+        assert_eq!(notice.description.as_deref(), Some(text.as_str()));
     }
 
     #[test]
@@ -300,5 +278,27 @@ mod tests {
         assert!(!is_output_limit_marker(&with_content));
 
         assert!(!is_output_limit_marker(&Message::assistant()));
+    }
+
+    #[test]
+    fn status_notifications_are_status_only_and_turn_outcomes_are_not() {
+        let status = |notification_type| {
+            Message::assistant().with_system_notification(notification_type, "status")
+        };
+
+        assert!(is_status_only(&status(
+            SystemNotificationType::InlineMessage
+        )));
+        assert!(is_status_only(&status(
+            SystemNotificationType::ProgressMessage
+        )));
+        assert!(!is_status_only(&status(
+            SystemNotificationType::CreditsExhausted
+        )));
+        assert!(!is_status_only(
+            &Message::assistant().with_error(MessageErrorKind::Other, "provider failed")
+        ));
+        assert!(!is_status_only(&Message::assistant().with_text("answer")));
+        assert!(!is_status_only(&output_limit_marker()));
     }
 }

@@ -93,7 +93,7 @@ Configurable retry parameters for LLM providers.
 
 #### All Providers
 
-A request that fails with a rate limit (HTTP 429), an overloaded or server error (5xx, including 529), or a network error is retried with exponential backoff. When the response says how long to wait (`Retry-After`, `retry-after-ms`, or the `x-ratelimit-reset-*` time of an exhausted limit), goose waits that long instead. Each retry is shown as a notification rather than added to the conversation.
+A request that fails with a rate limit (HTTP 429), an overloaded or server error (5xx, including 529), or a network error is retried with exponential backoff. When the response says how long to wait (`Retry-After`, `retry-after-ms`, or the `x-ratelimit-reset-*` time of an exhausted limit), goose waits that long instead. A hint shorter than one second or longer than an hour is ignored and normal backoff applies. Each retry is announced as a notification rather than added to the conversation, in the goose CLI and Desktop and in ACP clients that can present notices.
 
 A rate-limit or overload response gets more attempts than other errors, unless the provider asks to wait more than a minute or reports an exhausted quota. A server error that asks for a wait of more than a minute is not waited out.
 
@@ -488,6 +488,7 @@ These variables configure the `goose serve` ACP server process. They are alterna
 | `GOOSE_TLS_CERT_PATH` | Equivalent to `goose serve --tls-cert-path`. Must be used with `GOOSE_TLS_KEY_PATH`; setting it enables TLS. | File path | None |
 | `GOOSE_TLS_KEY_PATH` | Equivalent to `goose serve --tls-key-path`. Must be used with `GOOSE_TLS_CERT_PATH`; setting it enables TLS. | File path | None |
 | `GOOSE_SERVER__SECRET_KEY` | Shared secret required by the ACP endpoint unless `--dangerously-unauthenticated` is used. | Secret string | Required |
+| `GOOSE_ACP_ERRORS_AS_MESSAGES` | Whether a client that does not advertise ACP session notices receives errors, and the notice that a response hit the output-token limit, as agent messages. With `false`, a failed turn is reported only through the prompt's error response and stop reason (goose Desktop also gets a status message). Clients that advertise session notices always get a notice instead. | `true`, `false` | `true` |
 
 **Examples**
 

@@ -2110,6 +2110,7 @@ impl AcpConnection {
 
             match event {
                 Ok(crate::agents::AgentEvent::Message(mut message)) => {
+                    let turn_outcome = (output_token_limit_reached, last_message_was_error);
                     update_output_token_limit_reached(&mut output_token_limit_reached, &message);
 
                     if !self.has_session(session_id) {
@@ -2126,6 +2127,9 @@ impl AcpConnection {
                         populate_output_token_limit_content(&mut message);
                     }
                     last_message_was_error = message.error_kind().is_some();
+                    if notices::is_status_only(&message) {
+                        (output_token_limit_reached, last_message_was_error) = turn_outcome;
+                    }
                     for content_item in &message.content {
                         if let MessageContent::ToolRequest(tool_request) = content_item {
                             tool_requests.insert(tool_request.id.clone(), tool_request.clone());

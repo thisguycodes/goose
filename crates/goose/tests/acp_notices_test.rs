@@ -11,24 +11,17 @@ use agent_client_protocol::schema::v1::{
     PromptResponse, SessionNotification, SessionUpdate, StopReason, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
-use common_tests::fixtures::run_test;
+use agent_client_protocol::{Agent, Client, ConnectionTo};
+use common_tests::fixtures::{run_test, spawn_acp_server_in_process};
 use goose::acp::custom_notifications::{
     GooseSessionNotification, GooseSessionUpdate, StatusMessage,
 };
-use goose::acp::server::{
-    acp_services_config, serve, AcpBuiltinSelection, AcpConnection, AcpConnectionOptions,
-    AcpProviderFactory, LiveVoiceService,
-};
-use goose::agents::{GoosePlatform, StateMachineServices};
-use goose::config::paths::Paths;
-use goose::session::SessionManager;
+use goose::config::GooseMode;
 use goose_test_support::TEST_MODEL;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -170,6 +163,25 @@ impl Received {
     }
 }
 
+/// Pins the settings these tests depend on, whatever the developer's shell has
+/// exported, for as long as the guard lives.
+fn settings(extra: &[(&'static str, Option<&'static str>)]) -> env_lock::EnvGuard<'static> {
+    let mut settings = vec![
+        // Retries are under test, not the time spent waiting between them.
+        ("GOOSE_PROVIDER_SKIP_BACKOFF", Some("true")),
+        ("GOOSE_PROVIDER_RATE_LIMIT_MAX_RETRIES", None),
+        ("GOOSE_PROVIDER_MAX_STREAM_RESUMES", None),
+        ("GOOSE_PROVIDER_STREAM_RESUME_PARAMS", None),
+        ("GOOSE_PROVIDER_STREAM_RESUME", None),
+        ("GOOSE_ACP_ERRORS_AS_MESSAGES", None),
+    ];
+    for (name, value) in extra {
+        settings.retain(|(existing, _)| existing != name);
+        settings.push((name, *value));
+    }
+    env_lock::lock_env(settings)
+}
+
 struct TestClient {
     cx: ConnectionTo<Agent>,
     received: Arc<Mutex<Received>>,
@@ -178,58 +190,17 @@ struct TestClient {
 
 impl TestClient {
     async fn connect(backend: &Backend, client_capabilities: Value) -> Self {
-        // Retries are under test, not the time spent waiting between them.
-        std::env::set_var("GOOSE_PROVIDER_SKIP_BACKOFF", "true");
-        std::env::set_var("OPENAI_API_KEY", "test-key");
-
         let data_root = tempfile::tempdir().unwrap();
-        let config = format!(
-            "GOOSE_MODEL: {TEST_MODEL}\nGOOSE_PROVIDER: openai\nOPENAI_HOST: {}\n\
-             GOOSE_TOOL_PAIR_SUMMARIZATION: false\n",
-            backend.server.uri()
-        );
-        for config_dir in [data_root.path().to_path_buf(), Paths::config_dir()] {
-            std::fs::create_dir_all(&config_dir).unwrap();
-            std::fs::write(
-                config_dir.join(goose::config::base::CONFIG_YAML_NAME),
-                &config,
-            )
-            .unwrap();
-        }
-        std::fs::create_dir_all(Paths::in_state_dir("logs")).unwrap();
-
-        let services = StateMachineServices::with_config(acp_services_config(
-            Arc::new(SessionManager::new(data_root.path().to_path_buf())),
-            data_root.path().to_path_buf(),
+        let (transport, _server, _permissions) = spawn_acp_server_in_process(
+            &backend.server.uri(),
+            &[],
+            data_root.path(),
+            GooseMode::default(),
+            None,
+            TEST_MODEL,
             true,
-            GoosePlatform::GooseCli,
-        ));
-        let live_voice = Arc::new(LiveVoiceService::from_config(services.runtime.runs.clone()));
-        let provider_factory: AcpProviderFactory = Arc::new(|provider_name| {
-            Box::pin(async move { Err(anyhow::anyhow!("no provider named {provider_name}")) })
-        });
-        let connection = AcpConnection::new(AcpConnectionOptions {
-            provider_factory,
-            builtin_selection: AcpBuiltinSelection::default(),
-            config_dir: data_root.path().to_path_buf(),
-            services,
-            additional_source_roots: Vec::new(),
-            session_cwd: None,
-            live_voice,
-        })
-        .await
-        .unwrap();
-
-        let (client_read, server_write) = tokio::io::duplex(64 * 1024);
-        let (server_read, client_write) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(async move {
-            let _ = serve(
-                Arc::new(connection),
-                server_read.compat(),
-                server_write.compat_write(),
-            )
-            .await;
-        });
+        )
+        .await;
 
         let received = Arc::new(Mutex::new(Received::default()));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -268,7 +239,7 @@ impl TestClient {
                         agent_client_protocol::on_receive_notification!(),
                     )
                     .connect_with(
-                        ByteStreams::new(client_write.compat_write(), client_read.compat()),
+                        transport.into_byte_streams(),
                         async move |cx: ConnectionTo<Agent>| {
                             cx.send_request(initialize).block_task().await.unwrap();
                             let _ = ready_tx.send(cx.clone());
@@ -340,6 +311,7 @@ const FAILURE_GUIDANCE: &str =
 
 #[test]
 fn rate_limit_is_announced_as_a_notice_and_the_turn_completes() {
+    let _settings = settings(&[]);
     run_test(async {
         let backend = Backend::start(vec![rate_limited(), answer("Hello")]).await;
         let client = TestClient::connect(&backend, session_notices()).await;
@@ -364,9 +336,9 @@ fn rate_limit_is_announced_as_a_notice_and_the_turn_completes() {
 
 #[test]
 fn interrupted_response_is_resumed_and_announced() {
+    // Prefill is otherwise only on for providers known to support it.
+    let _settings = settings(&[("GOOSE_PROVIDER_STREAM_RESUME", Some("prefill"))]);
     run_test(async {
-        // Prefill is otherwise only on for providers known to support it.
-        std::env::set_var("GOOSE_PROVIDER_STREAM_RESUME", "prefill");
         let backend = Backend::start(vec![
             answer_cut_off_by_a_stream_error("Hello, "),
             answer("world"),
@@ -375,7 +347,6 @@ fn interrupted_response_is_resumed_and_announced() {
         let client = TestClient::connect(&backend, session_notices()).await;
 
         let (response, received) = client.prompt().await;
-        std::env::remove_var("GOOSE_PROVIDER_STREAM_RESUME");
 
         assert_eq!(response.unwrap().stop_reason, StopReason::EndTurn);
         assert_eq!(received.agent_text(), "Hello, world");
@@ -396,6 +367,7 @@ fn interrupted_response_is_resumed_and_announced() {
 
 #[test]
 fn turn_failure_is_a_notice_rather_than_an_agent_message() {
+    let _settings = settings(&[]);
     run_test(async {
         let backend = Backend::start(vec![bad_request()]).await;
         let client = TestClient::connect(&backend, session_notices()).await;
@@ -416,43 +388,75 @@ fn turn_failure_is_a_notice_rather_than_an_agent_message() {
 }
 
 #[test]
-fn goose_client_is_shown_a_turn_failure_as_a_status_message() {
+fn client_without_session_notices_gets_the_failure_as_an_agent_message() {
+    let _settings = settings(&[]);
+    for client_capabilities in [json!({}), goose_custom_notifications()] {
+        run_test(async move {
+            let backend = Backend::start(vec![bad_request()]).await;
+            let client = TestClient::connect(&backend, client_capabilities).await;
+
+            let (response, received) = client.prompt().await;
+
+            assert_eq!(failure_reason(&response.unwrap_err()), Some("turn_failed"));
+            assert_eq!(
+                received.agent_text(),
+                format!("{FAILURE_TITLE}\n\n{FAILURE_GUIDANCE}")
+            );
+            assert!(received.notices().is_empty());
+        });
+    }
+}
+
+#[test]
+fn goose_client_is_told_about_retries_through_status_messages() {
+    let _settings = settings(&[]);
     run_test(async {
-        let backend = Backend::start(vec![bad_request()]).await;
+        let backend = Backend::start(vec![rate_limited(), answer("Hello")]).await;
         let client = TestClient::connect(&backend, goose_custom_notifications()).await;
 
         let (response, received) = client.prompt().await;
 
-        assert_eq!(failure_reason(&response.unwrap_err()), Some("turn_failed"));
-        assert_eq!(received.agent_text(), "");
-        assert!(received.notices().is_empty());
-        assert_eq!(
-            received.status_notices().last().copied(),
-            Some(format!("{FAILURE_TITLE}\n\n{FAILURE_GUIDANCE}").as_str())
+        assert_eq!(response.unwrap().stop_reason, StopReason::EndTurn);
+        assert_eq!(received.agent_text(), "Hello");
+        let retrying = format!(
+            "Rate limit exceeded: slow down. Retrying in under a second \
+             (attempt 1 of {RATE_LIMIT_MAX_RETRIES})."
         );
+        assert_eq!(received.status_notices(), vec![retrying.as_str()]);
     });
 }
 
 #[test]
-fn client_without_a_notice_channel_gets_the_failure_as_an_agent_message() {
+fn errors_can_be_kept_out_of_the_transcript_for_every_client() {
+    let _settings = settings(&[("GOOSE_ACP_ERRORS_AS_MESSAGES", Some("false"))]);
     run_test(async {
         let backend = Backend::start(vec![bad_request()]).await;
         let client = TestClient::connect(&backend, json!({})).await;
-
         let (response, received) = client.prompt().await;
-
         assert_eq!(failure_reason(&response.unwrap_err()), Some("turn_failed"));
+        assert_eq!(received.agent_text(), "");
+
+        let backend = Backend::start(vec![bad_request()]).await;
+        let client = TestClient::connect(&backend, goose_custom_notifications()).await;
+        let (response, received) = client.prompt().await;
+        assert_eq!(failure_reason(&response.unwrap_err()), Some("turn_failed"));
+        assert_eq!(received.agent_text(), "");
         assert_eq!(
-            received.agent_text(),
-            format!("{FAILURE_TITLE}\n\n{FAILURE_GUIDANCE}")
+            received.status_notices().last().copied(),
+            Some(format!("{FAILURE_TITLE}\n\n{FAILURE_GUIDANCE}").as_str())
         );
-        assert!(received.notices().is_empty());
-        assert!(received.status_notices().is_empty());
+
+        let backend = Backend::start(vec![output_limit_before_any_content()]).await;
+        let client = TestClient::connect(&backend, json!({})).await;
+        let (response, received) = client.prompt().await;
+        assert_eq!(response.unwrap().stop_reason, StopReason::MaxTokens);
+        assert_eq!(received.agent_text(), "");
     });
 }
 
 #[test]
 fn output_limit_without_content_is_a_warning_notice() {
+    let _settings = settings(&[]);
     run_test(async {
         let backend = Backend::start(vec![output_limit_before_any_content()]).await;
         let client = TestClient::connect(&backend, session_notices()).await;

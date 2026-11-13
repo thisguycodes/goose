@@ -4,7 +4,8 @@
 //! capacity errors (529, or a 5xx carrying `Retry-After`) ask for the same
 //! wait-then-retry as a rate limit, some send the wait in milliseconds or as the
 //! time a `x-ratelimit-*` window resets, and the `x-ratelimit-remaining-*`
-//! headers name the limit that ran out.
+//! headers name the limit that ran out. Baseten also identifies the request in
+//! a header of its own, which support asks for.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +18,8 @@ use crate::http_status::{extract_retry_after, parse_request_id_suffix, request_i
 
 /// Not in the IANA registry; Baseten and Anthropic use it for "out of capacity".
 const STATUS_OVERLOADED: u16 = 529;
+
+const BASETEN_REQUEST_ID_HEADER: &str = "x-baseten-request-id";
 
 /// A shorter hint is dropped so that exponential backoff applies: "retry now"
 /// from several clients at once is how an overloaded server stays overloaded.
@@ -43,7 +46,7 @@ pub(crate) fn apply(
     headers: &HeaderMap,
     payload: Option<&Value>,
 ) -> ProviderError {
-    match error {
+    match with_baseten_request_id(error, headers) {
         ProviderError::RateLimitExceeded {
             details,
             retry_delay,
@@ -75,6 +78,16 @@ pub(crate) fn apply(
         }
         other => other,
     }
+}
+
+fn with_baseten_request_id(mut error: ProviderError, headers: &HeaderMap) -> ProviderError {
+    let request_id = header_text(headers, BASETEN_REQUEST_ID_HEADER);
+    if let (Some(details), Some(_)) = (error.details_mut(), request_id) {
+        if parse_request_id_suffix(details).is_none() {
+            details.push_str(&request_id_message_suffix(request_id));
+        }
+    }
+    error
 }
 
 fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -349,6 +362,31 @@ mod tests {
     #[test]
     fn reset_timestamp_in_the_past_is_not_a_wait() {
         assert_eq!(parse_reset("1700000000"), None);
+    }
+
+    #[test]
+    fn baseten_request_id_is_attached_unless_the_error_already_names_one() {
+        let from_baseten = headers(&[(BASETEN_REQUEST_ID_HEADER, "req_baseten")]);
+
+        let error = apply(
+            ProviderError::RequestFailed("Bad request (400): nope".to_string()),
+            StatusCode::BAD_REQUEST,
+            &from_baseten,
+            None,
+        );
+        assert_eq!(
+            parse_request_id_suffix(&error.to_string()).as_deref(),
+            Some("req_baseten")
+        );
+
+        let already_identified = format!("nope{}", request_id_message_suffix(Some("req_other")));
+        let error = apply(
+            ProviderError::RequestFailed(already_identified.clone()),
+            StatusCode::BAD_REQUEST,
+            &from_baseten,
+            None,
+        );
+        assert_eq!(error, ProviderError::RequestFailed(already_identified));
     }
 
     #[test]

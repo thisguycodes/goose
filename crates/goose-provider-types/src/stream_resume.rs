@@ -637,7 +637,19 @@ mod tests {
         }
     }
 
+    /// Pins the settings these tests depend on, whatever the developer's shell
+    /// has exported, for as long as the guard lives.
+    fn settings() -> env_lock::EnvGuard<'static> {
+        env_lock::lock_env([
+            (STREAM_RESUME_ENV, None::<&str>),
+            (MAX_STREAM_RESUMES_ENV, None),
+            (STREAM_RESUME_PARAMS_ENV, None),
+            ("GOOSE_PROVIDER_SKIP_BACKOFF", None),
+        ])
+    }
+
     async fn run(provider: &Arc<ScriptedProvider>) -> Outcome {
+        let _settings = settings();
         let mut outcome = Outcome {
             messages: Vec::new(),
             error: None,
@@ -909,6 +921,7 @@ mod tests {
             vec![cut_off(), cut_off(), cut_off(), cut_off()],
         );
 
+        let _settings = settings();
         let stream = stream(
             provider.clone(),
             &ModelConfig::new("model"),

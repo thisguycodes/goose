@@ -421,9 +421,7 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 pub fn extract_request_id(headers: &HeaderMap) -> Option<String> {
-    header_value(headers, "request-id")
-        .or_else(|| header_value(headers, "x-baseten-request-id"))
-        .or_else(|| header_value(headers, "x-request-id"))
+    header_value(headers, "request-id").or_else(|| header_value(headers, "x-request-id"))
 }
 
 /// Inverse of [`parse_request_id_suffix`] — change these together.
