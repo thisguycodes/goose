@@ -13,14 +13,14 @@ use crate::agents::extension_manager::{ExtensionLease, ExtensionManager};
 use crate::agents::state_machine::UnavailableDecisions;
 use crate::agents::state_machine::{
     deny_limit_warning, BangShellOperation, CompactionOperation, ContextRelevanceOperation,
-    DoctorOperation, EmptyResponseOperation, ExitOnErrorOperation, GooseEffect,
-    GooseInferenceProvider, GooseInferenceRequestPreparer, GoosePostToolHook, GoosePreToolHook,
-    GooseStopHook, GooseToolApproval, InferenceRunner, MaxTurnsOperation, Operation,
-    PreToolCallHookOperation, ProjectOperation, PursueOperation, RecipeOperation,
-    RemainingToolCallsOperation, RetryOperation, SkillOperation, SlashCommandOperation,
-    StateMachine, StatusOperation, SteerOperation, SteerQueue, Step, StopHookOperation,
-    SubagentOperation, ToolApprovalOperation, ToolExecutionOperation, ToolPairCompactionOperation,
-    UnhandledToolCallsOperation,
+    DoctorOperation, EmptyResponseOperation, ExitOnErrorOperation, FinalOutputOperation,
+    GooseEffect, GooseInferenceProvider, GooseInferenceRequestPreparer, GoosePostToolHook,
+    GoosePreToolHook, GooseStopHook, GooseToolApproval, InferenceRunner, Operation,
+    PreToolCallHookOperation, ProjectOperation, PursueMaxTurnsOperation, PursueOperation,
+    RecipeOperation, RemainingToolCallsOperation, RetryOperation, SkillOperation,
+    SlashCommandOperation, StateMachine, StatusOperation, SteerOperation, SteerQueue, Step,
+    StopHookOperation, SubagentOperation, ToolApprovalOperation, ToolExecutionOperation,
+    ToolPairCompactionOperation, UnhandledToolCallsOperation,
 };
 use crate::agents::subagent_handler::ForegroundSubagentRunner;
 use crate::agents::tool_execution::DECLINED_RESPONSE;
@@ -37,6 +37,8 @@ pub(crate) struct StateMachineConfig<'a> {
     pub(crate) compaction_threshold: f64,
     pub(crate) tool_call_cutoff: usize,
     pub(crate) tool_pair_summarization: bool,
+    pub(crate) defer_tools: bool,
+    pub(crate) always_load_tools: Vec<String>,
     pub(crate) session_manager: Arc<SessionManager>,
     pub(crate) extension_manager: Arc<ExtensionManager>,
     pub(crate) extension_lease: Arc<StdMutex<Option<Arc<ExtensionLease>>>>,
@@ -100,6 +102,8 @@ pub(crate) fn build_state_machine(
         compaction_threshold,
         tool_call_cutoff,
         tool_pair_summarization,
+        defer_tools,
+        always_load_tools,
         session_manager,
         extension_manager,
         extension_lease,
@@ -122,6 +126,7 @@ pub(crate) fn build_state_machine(
         Arc::clone(&extension_lease),
     ));
     let mut operations: Vec<Arc<dyn Operation<Session, GooseEffect> + '_>> = vec![
+        Arc::new(FinalOutputOperation::new(provider.clone())),
         Arc::new(
             ToolApprovalOperation::new(Arc::new(GooseToolApproval::new(tool_inspection_manager)))
                 .with_declined_message(DECLINED_RESPONSE),
@@ -133,13 +138,7 @@ pub(crate) fn build_state_machine(
             Arc::clone(&extension_lease),
             Arc::clone(&post_tool_call_hook),
         )),
-        Arc::new(RecipeOperation::new(
-            provider.clone(),
-            Arc::clone(&extension_manager),
-            Arc::clone(&post_tool_call_hook),
-        )),
-        // Before ToolExecutionOperation so it executes its own pursue__done tool,
-        // and before MaxTurnsOperation so a pursuit is never turn-capped.
+        Arc::new(RecipeOperation::new(Arc::clone(&extension_manager))),
         Arc::new(PursueOperation::new(
             provider.clone(),
             Arc::clone(&post_tool_call_hook),
@@ -149,6 +148,8 @@ pub(crate) fn build_state_machine(
             hook_manager.clone(),
             Arc::clone(&post_tool_call_hook),
             Arc::clone(&extension_lease),
+            defer_tools,
+            always_load_tools,
         )),
         Arc::new(RemainingToolCallsOperation::new(
             hook_manager.clone(),
@@ -197,7 +198,8 @@ pub(crate) fn build_state_machine(
                 .with_deny_limit_message(move || deny_limit_warning(stop_hook_block_cap)),
         ),
         Arc::new(ExitOnErrorOperation),
-        Arc::new(MaxTurnsOperation::new(max_turns)),
+        Arc::new(PursueMaxTurnsOperation::new(max_turns)),
+        Arc::new(StatusOperation::new(provider.clone(), model_config.clone())),
     ];
     operations.extend(remaining_operations);
     operations.extend(extra_operations);
@@ -207,16 +209,13 @@ pub(crate) fn build_state_machine(
         tool_inspection_manager,
         context_limit,
     };
-    let status_operation = Arc::new(StatusOperation::new(provider.clone(), model_config.clone()));
     let inference_provider = Arc::new(GooseInferenceProvider::new(provider));
     let inference = Arc::new(
         InferenceRunner::new(inference_provider, model_config)
             .with_request_preparer(Arc::new(request_preparer)),
     );
-    let mut command_handlers = operations.clone();
-    command_handlers.push(status_operation);
     let command_operation: Arc<dyn Operation<Session, GooseEffect> + '_> =
-        Arc::new(SlashCommandOperation::new(command_handlers));
+        Arc::new(SlashCommandOperation::new(operations.clone()));
     let steps = std::iter::once(command_operation)
         .chain(operations)
         .map(Step::Operation)

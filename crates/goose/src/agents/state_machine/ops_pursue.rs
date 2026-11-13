@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use goose_agent::max_turns::MaxTurnsOperation;
 use goose_agent::post_tool_call_hook::PostToolCallHook;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorCode, ErrorData, Tool, ToolAnnotations};
 
-use crate::agents::state_machine::ops_recipe::has_sibling_tool_calls;
+use crate::agents::state_machine::ops_final_output::has_sibling_tool_calls;
 use crate::agents::state_machine::ops_toolcalling::{
     pending_advertised_tool_requests, ToolDisposition,
 };
@@ -31,9 +32,8 @@ pub const PURSUE_DONE_NOT_ALONE_MESSAGE: &str =
 pub const PURSUE_DONE_MISSING_SUMMARY_MESSAGE: &str =
     "pursue__done requires a non-empty `summary` string argument.";
 
-/// A `pursue__done` call submitted alongside other tools is rejected without
-/// executing, like the recipe final-output tool, so lifecycle hooks and
-/// approval prompts must treat it as a call that will not run.
+/// A sibling completion is rejected without running, so approval and lifecycle
+/// hooks must skip it just like the operation itself does.
 pub(super) fn pursue_done_called_with_other_tools(
     messages: &[Message],
     request: &ToolRequest,
@@ -345,5 +345,49 @@ impl Operation<Session, GooseEffect> for PursueOperation {
         }
 
         not_applicable()
+    }
+}
+
+/// The shared turn-budget operation, gated off while a pursue goal is active so
+/// that a pursuit is never capped before it confirms completion.
+pub struct PursueMaxTurnsOperation {
+    inner: MaxTurnsOperation,
+}
+
+impl PursueMaxTurnsOperation {
+    pub fn new(max_turns: u32) -> Self {
+        Self {
+            inner: MaxTurnsOperation::new(max_turns),
+        }
+    }
+}
+
+#[async_trait]
+impl Operation<Session, GooseEffect> for PursueMaxTurnsOperation {
+    fn name(&self) -> &'static str {
+        Operation::<Session, GooseEffect>::name(&self.inner)
+    }
+
+    async fn moim_parts(
+        &self,
+        session: &Session,
+        conversation: &Conversation,
+    ) -> Result<Vec<String>> {
+        if GoalState::of(session).pursue.is_some() {
+            return Ok(Vec::new());
+        }
+        Operation::<Session, GooseEffect>::moim_parts(&self.inner, session, conversation).await
+    }
+
+    async fn run(
+        &self,
+        session: &Session,
+        conversation: &Conversation,
+        emit: &Emitter,
+    ) -> Result<OperationResult<GooseEffect>> {
+        if GoalState::of(session).pursue.is_some() {
+            return not_applicable();
+        }
+        Operation::<Session, GooseEffect>::run(&self.inner, session, conversation, emit).await
     }
 }
