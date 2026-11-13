@@ -1,12 +1,12 @@
 //! What a failed response says about when to try again.
 //!
 //! `http_status` reads the `Retry-After` of a 429. Providers say more than that:
-//! capacity errors (529, or any 5xx carrying `Retry-After`) ask for the same
+//! capacity errors (529, or a 5xx carrying `Retry-After`) ask for the same
 //! wait-then-retry as a rate limit, some send the wait in milliseconds or as the
-//! time until a `x-ratelimit-*` window resets, and the `x-ratelimit-remaining-*`
+//! time a `x-ratelimit-*` window resets, and the `x-ratelimit-remaining-*`
 //! headers name the limit that ran out.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::StatusCode;
@@ -18,9 +18,22 @@ use crate::http_status::{extract_retry_after, parse_request_id_suffix, request_i
 /// Not in the IANA registry; Baseten and Anthropic use it for "out of capacity".
 const STATUS_OVERLOADED: u16 = 529;
 
-/// Matches the cap `http_status` puts on `Retry-After`: a malformed hint should
-/// not freeze the agent.
+/// A shorter hint is dropped so that exponential backoff applies: "retry now"
+/// from several clients at once is how an overloaded server stays overloaded.
+const MIN_HINT: Duration = Duration::from_secs(1);
+
+/// A longer hint from the headers read here is taken as malformed, matching the
+/// cap `http_status` puts on `Retry-After`.
 const MAX_HINT: Duration = Duration::from_secs(3600);
+
+/// A server error is only worth waiting out when the wait is short; a
+/// maintenance window should end the turn rather than hold it open.
+const MAX_SERVER_ERROR_WAIT: Duration = Duration::from_secs(60);
+
+/// Numeric `x-ratelimit-reset-*` values at least this large are Unix timestamps
+/// (in seconds, or in milliseconds from `EPOCH_MILLIS`) rather than seconds from now.
+const EPOCH_SECONDS: f64 = 1e9;
+const EPOCH_MILLIS: f64 = 1e11;
 
 const RATE_LIMIT_KINDS: [&str; 2] = ["requests", "tokens"];
 
@@ -36,16 +49,24 @@ pub(crate) fn apply(
             retry_delay,
         } => ProviderError::RateLimitExceeded {
             details: with_remaining_allowance(details, headers),
-            retry_delay: retry_delay.or_else(|| delay_from_headers(headers)),
+            retry_delay: retry_delay
+                .or_else(|| delay_from_headers(headers))
+                .filter(|delay| *delay >= MIN_HINT),
         },
         // Out of capacity is not an account limit, but it clears the same way:
         // wait as long as the server asks, then send the request again.
         ProviderError::ServerError(details) => {
-            let retry_delay =
-                extract_retry_after(headers, payload).or_else(|| delay_from_headers(headers));
-            if status.as_u16() == STATUS_OVERLOADED || retry_delay.is_some() {
+            let retry_delay = extract_retry_after(headers, payload)
+                .or_else(|| delay_from_headers(headers))
+                .filter(|delay| *delay >= MIN_HINT);
+            if status.as_u16() == STATUS_OVERLOADED {
                 ProviderError::RateLimitExceeded {
-                    details,
+                    details: format!("the provider is overloaded. {details}"),
+                    retry_delay,
+                }
+            } else if retry_delay.is_some_and(|delay| delay <= MAX_SERVER_ERROR_WAIT) {
+                ProviderError::RateLimitExceeded {
+                    details: format!("the provider asked to retry later. {details}"),
                     retry_delay,
                 }
             } else {
@@ -61,9 +82,9 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     (!value.is_empty()).then_some(value)
 }
 
-fn bounded(seconds: f64) -> Option<Duration> {
-    (seconds.is_finite() && seconds >= 0.0)
-        .then(|| Duration::from_secs_f64(seconds.min(MAX_HINT.as_secs_f64())))
+fn in_range(seconds: f64) -> Option<Duration> {
+    (seconds.is_finite() && (0.0..=MAX_HINT.as_secs_f64()).contains(&seconds))
+        .then(|| Duration::from_secs_f64(seconds))
 }
 
 /// Retry hints `extract_retry_after` does not read: `retry-after-ms`, a
@@ -71,11 +92,11 @@ fn bounded(seconds: f64) -> Option<Duration> {
 fn delay_from_headers(headers: &HeaderMap) -> Option<Duration> {
     header_text(headers, "retry-after-ms")
         .and_then(|value| value.parse::<f64>().ok())
-        .and_then(|millis| bounded(millis / 1000.0))
+        .and_then(|millis| in_range(millis / 1000.0))
         .or_else(|| {
             header_text(headers, RETRY_AFTER.as_str())
                 .and_then(|value| value.parse::<f64>().ok())
-                .and_then(bounded)
+                .and_then(in_range)
         })
         .or_else(|| exhausted_limit_reset(headers))
 }
@@ -94,11 +115,11 @@ fn exhausted_limit_reset(headers: &HeaderMap) -> Option<Duration> {
         .max()
 }
 
-/// `x-ratelimit-reset-*` is either plain seconds or a Go-style duration such as
-/// `250ms`, `1.5s` or `6m0s`.
+/// `x-ratelimit-reset-*` has no standard form. Providers send seconds from now,
+/// a Go-style duration such as `250ms`, `1.5s` or `6m0s`, or a Unix timestamp.
 fn parse_reset(value: &str) -> Option<Duration> {
-    if let Ok(seconds) = value.parse::<f64>() {
-        return bounded(seconds);
+    if let Ok(number) = value.parse::<f64>() {
+        return in_range(seconds_until(number));
     }
 
     let is_numeric = |c: char| c.is_ascii_digit() || c == '.';
@@ -117,7 +138,21 @@ fn parse_reset(value: &str) -> Option<Duration> {
         total += amount.parse::<f64>().ok()? * unit_seconds;
         rest = after_unit;
     }
-    bounded(total)
+    in_range(total)
+}
+
+fn seconds_until(number: f64) -> f64 {
+    let epoch_seconds = if number >= EPOCH_MILLIS {
+        number / 1000.0
+    } else if number >= EPOCH_SECONDS {
+        number
+    } else {
+        return number;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    epoch_seconds - now.as_secs_f64()
 }
 
 fn split_where(text: &str, boundary: impl Fn(char) -> bool) -> (&str, &str) {
@@ -179,60 +214,52 @@ mod tests {
         StatusCode::from_u16(STATUS_OVERLOADED).unwrap()
     }
 
+    fn server_error(status: StatusCode, pairs: &[(&str, &str)]) -> ProviderError {
+        apply(
+            ProviderError::ServerError("boom".to_string()),
+            status,
+            &headers(pairs),
+            None,
+        )
+    }
+
     #[test]
     fn overloaded_backs_off_like_a_rate_limit() {
-        let error = apply(
-            ProviderError::ServerError("no capacity".to_string()),
-            overloaded(),
-            &HeaderMap::new(),
-            None,
+        assert_eq!(
+            server_error(overloaded(), &[]),
+            rate_limited("the provider is overloaded. boom", None)
         );
-
-        assert_eq!(error, rate_limited("no capacity", None));
     }
 
     #[test]
     fn overloaded_waits_as_long_as_retry_after_asks() {
-        let error = apply(
-            ProviderError::ServerError("no capacity".to_string()),
-            overloaded(),
-            &headers(&[("retry-after", "7")]),
-            None,
-        );
-
         assert_eq!(
-            error,
-            rate_limited("no capacity", Some(Duration::from_secs(7)))
+            server_error(overloaded(), &[("retry-after", "7")]),
+            rate_limited(
+                "the provider is overloaded. boom",
+                Some(Duration::from_secs(7))
+            )
         );
     }
 
     #[test]
-    fn server_error_with_retry_after_honors_the_wait() {
-        let error = apply(
-            ProviderError::ServerError("draining".to_string()),
-            StatusCode::SERVICE_UNAVAILABLE,
-            &headers(&[("retry-after", "3")]),
-            None,
-        );
-
+    fn server_error_with_a_short_retry_after_is_waited_out() {
         assert_eq!(
-            error,
-            rate_limited("draining", Some(Duration::from_secs(3)))
+            server_error(StatusCode::SERVICE_UNAVAILABLE, &[("retry-after", "3")]),
+            rate_limited(
+                "the provider asked to retry later. boom",
+                Some(Duration::from_secs(3))
+            )
         );
     }
 
-    #[test]
-    fn server_error_without_a_hint_is_unchanged() {
-        let error = ProviderError::ServerError("boom".to_string());
-
+    #[test_case(&[("retry-after", "3600")] ; "long wait")]
+    #[test_case(&[("retry-after", "0")] ; "retry now")]
+    #[test_case(&[] ; "no hint")]
+    fn other_server_errors_are_unchanged(pairs: &[(&str, &str)]) {
         assert_eq!(
-            apply(
-                error.clone(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &HeaderMap::new(),
-                None
-            ),
-            error
+            server_error(StatusCode::SERVICE_UNAVAILABLE, pairs),
+            ProviderError::ServerError("boom".to_string())
         );
     }
 
@@ -241,7 +268,7 @@ mod tests {
         let error = apply(
             rate_limited("slow down", Some(Duration::from_secs(17))),
             StatusCode::TOO_MANY_REQUESTS,
-            &headers(&[("retry-after-ms", "250")]),
+            &headers(&[("retry-after-ms", "2500")]),
             None,
         );
 
@@ -249,6 +276,18 @@ mod tests {
             error,
             rate_limited("slow down", Some(Duration::from_secs(17)))
         );
+    }
+
+    #[test]
+    fn retry_now_is_left_to_exponential_backoff() {
+        let error = apply(
+            rate_limited("slow down", Some(Duration::ZERO)),
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers(&[("retry-after", "0")]),
+            None,
+        );
+
+        assert_eq!(error, rate_limited("slow down", None));
     }
 
     #[test_case(&[("retry-after-ms", "1500")], Some(Duration::from_millis(1500)) ; "milliseconds")]
@@ -259,10 +298,13 @@ mod tests {
         Some(Duration::from_secs(360)) ; "reset of the exhausted limit"
     )]
     #[test_case(
-        &[("x-ratelimit-remaining-requests", "5"), ("x-ratelimit-reset-requests", "1s")],
+        &[("x-ratelimit-remaining-requests", "5"), ("x-ratelimit-reset-requests", "2s")],
         None ; "reset of a limit with allowance left is not a wait"
     )]
-    #[test_case(&[("x-ratelimit-reset-requests", "soon")], None ; "unparseable reset")]
+    #[test_case(
+        &[("x-ratelimit-remaining-requests", "0"), ("x-ratelimit-reset-requests", "soon")],
+        None ; "unparseable reset"
+    )]
     #[test_case(&[], None ; "no hint")]
     fn rate_limit_delay_comes_from_headers(pairs: &[(&str, &str)], expected: Option<Duration>) {
         let error = apply(
@@ -278,13 +320,35 @@ mod tests {
         assert_eq!(retry_delay, expected);
     }
 
-    #[test_case("250ms", Duration::from_millis(250))]
-    #[test_case("1.5s", Duration::from_millis(1500))]
-    #[test_case("1m2s", Duration::from_secs(62))]
-    #[test_case("12", Duration::from_secs(12))]
-    #[test_case("99999h", MAX_HINT)]
-    fn reset_durations_parse(value: &str, expected: Duration) {
-        assert_eq!(parse_reset(value), Some(expected));
+    #[test_case("250ms", Some(Duration::from_millis(250)))]
+    #[test_case("1.5s", Some(Duration::from_millis(1500)))]
+    #[test_case("1m2s", Some(Duration::from_secs(62)))]
+    #[test_case("12", Some(Duration::from_secs(12)))]
+    #[test_case("99999h", None ; "longer than any real window")]
+    #[test_case("5m30", None ; "missing unit")]
+    fn reset_durations_parse(value: &str, expected: Option<Duration>) {
+        assert_eq!(parse_reset(value), expected);
+    }
+
+    #[test_case(1.0 ; "unix seconds")]
+    #[test_case(1000.0 ; "unix milliseconds")]
+    fn reset_timestamp_is_the_time_left_until_it(scale: f64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        let delay = parse_reset(&format!("{:.0}", (now + 30.0) * scale)).unwrap();
+
+        assert!(
+            (28.0..=30.5).contains(&delay.as_secs_f64()),
+            "expected about 30s, got {delay:?}"
+        );
+    }
+
+    #[test]
+    fn reset_timestamp_in_the_past_is_not_a_wait() {
+        assert_eq!(parse_reset("1700000000"), None);
     }
 
     #[test]

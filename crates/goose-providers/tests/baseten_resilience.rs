@@ -100,6 +100,11 @@ fn user_prompt() -> Vec<Message> {
     vec![Message::user().with_text("Say hello")]
 }
 
+/// Retries are under test, not the time spent waiting between them.
+fn skip_backoff() {
+    std::env::set_var("GOOSE_PROVIDER_SKIP_BACKOFF", "true");
+}
+
 fn recording_observer() -> (RetryObserver, Arc<Mutex<Vec<RetryNotice>>>) {
     let notices = Arc::new(Mutex::new(Vec::new()));
     let sink = notices.clone();
@@ -210,11 +215,12 @@ async fn output_limit_is_continued_with_twice_the_default_budget() {
 
 #[tokio::test]
 async fn overloaded_response_is_retried_after_the_wait_it_asks_for() {
+    skip_backoff();
     let server = MockServer::start().await;
     chat_completions()
         .respond_with(
             ResponseTemplate::new(529)
-                .insert_header("retry-after", "0")
+                .insert_header("retry-after", "2")
                 .insert_header("x-baseten-request-id", "req_overloaded")
                 .set_body_json(json!({"error": "no capacity"})),
         )
@@ -252,15 +258,16 @@ async fn overloaded_response_is_retried_after_the_wait_it_asks_for() {
                 retry_delay,
             },
         attempt: 1,
-        delay,
         ..
     }] = notices.as_slice()
     else {
         panic!("expected one retry notice for the overload, got {notices:?}");
     };
-    assert_eq!(*retry_delay, Some(Duration::ZERO));
-    assert_eq!(*delay, Duration::ZERO);
-    assert!(details.contains("529"), "{details}");
+    assert_eq!(*retry_delay, Some(Duration::from_secs(2)));
+    assert!(
+        details.starts_with("the provider is overloaded. Server error (529"),
+        "{details}"
+    );
     assert!(
         details.ends_with("(provider request id: req_overloaded)"),
         "{details}"
@@ -269,11 +276,11 @@ async fn overloaded_response_is_retried_after_the_wait_it_asks_for() {
 
 #[tokio::test]
 async fn rate_limit_notice_names_the_limit_that_ran_out() {
+    skip_backoff();
     let server = MockServer::start().await;
     chat_completions()
         .respond_with(
             ResponseTemplate::new(429)
-                .insert_header("retry-after", "0")
                 .insert_header("x-ratelimit-limit-requests", "120")
                 .insert_header("x-ratelimit-remaining-requests", "0")
                 .insert_header("x-ratelimit-limit-tokens", "500000")
@@ -326,15 +333,23 @@ async fn rate_limit_notice_names_the_limit_that_ran_out() {
 fn baseten_host_selects_its_retry_and_resume_behaviour() {
     let model = ModelConfig::new(MODEL);
 
-    let baseten = provider_at("https://inference.baseten.co");
-    assert!(baseten.retry_config().transient_only);
+    let model_apis = provider_at("https://inference.baseten.co");
+    assert!(model_apis.retry_config().transient_only);
     assert_eq!(
-        baseten.stream_resume_policy(&model),
+        model_apis.stream_resume_policy(&model),
         baseten::stream_resume_policy()
     );
     // Routed to the Responses API, which has its own completion events.
     assert_eq!(
-        baseten.stream_resume_policy(&ModelConfig::new("openai/gpt-5")),
+        model_apis.stream_resume_policy(&ModelConfig::new("openai/gpt-5")),
+        StreamResumePolicy::default()
+    );
+
+    // Whatever server a dedicated deployment runs, Baseten's retry guidance holds.
+    let dedicated = provider_at("https://model-abc123.api.baseten.co");
+    assert!(dedicated.retry_config().transient_only);
+    assert_eq!(
+        dedicated.stream_resume_policy(&model),
         StreamResumePolicy::default()
     );
 

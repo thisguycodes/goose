@@ -48,10 +48,8 @@ const INCOMPLETE_STREAM_ERROR: &str =
 pub struct StreamResumePolicy {
     /// The provider continues a trailing assistant message rather than answering it.
     pub prefill: bool,
-    /// Request parameters that make the provider continue the prefill. Servers
-    /// differ in which spelling they accept, so each set is tried in turn until
-    /// one is not rejected.
-    pub prefill_request_params: Vec<HashMap<String, Value>>,
+    /// Request parameters that make the provider continue the prefill.
+    pub prefill_request_params: HashMap<String, Value>,
     /// Every complete response reports a finish reason, so a stream that ends
     /// without one was cut off.
     pub requires_finish_reason: bool,
@@ -68,10 +66,18 @@ enum AttemptEnd {
     Interrupted(ProviderError),
 }
 
+/// Why the response is being asked for again.
+enum Continuing {
+    AfterInterruption(ProviderError),
+    AfterOutputLimit,
+}
+
 /// What has already been handed to the caller, which a continuation must build on.
 #[derive(Default)]
 struct Delivered {
     started: bool,
+    /// Whether the caller has been handed any item at all, even an empty one.
+    yielded: bool,
     content: bool,
     text: String,
     tool_request: bool,
@@ -82,6 +88,7 @@ struct Delivered {
 
 impl Delivered {
     fn record(&mut self, message: Option<&Message>) {
+        self.yielded = true;
         let Some(message) = message else {
             return;
         };
@@ -182,7 +189,7 @@ fn effective_policy(
         _ => {}
     }
     if let Some(params) = configured_prefill_params() {
-        policy.prefill_request_params = vec![params];
+        policy.prefill_request_params = params;
     }
     Some(policy)
 }
@@ -224,14 +231,11 @@ struct Request {
 }
 
 impl Request {
-    /// Asks for the rest of the response. `accepted_params` remembers which
-    /// prefill parameters the provider took, so later continuations start there.
     async fn continuation(
         &self,
         max_tokens: Option<i32>,
         delivered: &Delivered,
         policy: &StreamResumePolicy,
-        accepted_params: &mut usize,
     ) -> Result<MessageStream, ProviderError> {
         let mut model_config = self.model_config.clone();
         model_config.max_tokens = max_tokens;
@@ -242,24 +246,13 @@ impl Request {
                 .await;
         }
 
+        let model_config =
+            model_config.with_merged_request_params(policy.prefill_request_params.clone());
         let mut messages = self.messages.clone();
         messages.push(Message::assistant().with_text(&delivered.text));
-        loop {
-            let params = policy.prefill_request_params.get(*accepted_params);
-            let model_config = model_config
-                .clone()
-                .with_merged_request_params(params.cloned().unwrap_or_default());
-            let result = self
-                .provider
-                .stream(&model_config, &self.system, &messages, &self.tools)
-                .await;
-            let rejected = matches!(result, Err(ProviderError::RequestFailed(_)));
-            if rejected && *accepted_params + 1 < policy.prefill_request_params.len() {
-                *accepted_params += 1;
-                continue;
-            }
-            return result;
-        }
+        self.provider
+            .stream(&model_config, &self.system, &messages, &self.tools)
+            .await
     }
 }
 
@@ -297,12 +290,12 @@ pub async fn stream(
         let mut interruptions = 0;
         let mut output_limit_continuations = 0;
         let mut max_tokens = request.model_config.max_tokens;
-        let mut accepted_params = 0;
-        let mut resumed = false;
+        let mut continuing: Option<Continuing> = None;
 
         loop {
             let mut finish_seen = false;
             let mut output_limit_reached = false;
+            let progress_before = (delivered.text.len(), delivered.tool_request);
             // A cut-off stream still yields the tool calls it was part-way through,
             // with truncated arguments. They are held until the response proves complete.
             let mut held: Vec<StreamItem> = Vec::new();
@@ -326,13 +319,16 @@ pub async fn stream(
                     .as_mut()
                     .filter(|message| message.metadata.output_token_limit_reached)
                 {
+                    // With no text to continue from, asking again only helps if
+                    // the next request gets more room than this one had.
+                    let budget = max_tokens.or(policy.default_max_tokens);
                     let can_continue = policy.prefill
                         && output_limit_continuations < max_resumes
                         && !delivered.tool_request
                         && !has_usable_tool_request(limited)
                         && (!delivered.text.is_empty()
                             || has_text(limited)
-                            || max_tokens.or(policy.default_max_tokens).is_some());
+                            || raise_output_budget(max_tokens, &policy) > budget);
                     if can_continue {
                         output_limit_reached = true;
                         limited.metadata.output_token_limit_reached = false;
@@ -347,7 +343,7 @@ pub async fn stream(
                 if emptied {
                     message = None;
                 }
-                if resumed {
+                if continuing.is_some() {
                     if let (Some(message), Some(anchor_id)) =
                         (message.as_mut(), &delivered.anchor_id)
                     {
@@ -372,7 +368,24 @@ pub async fn stream(
                 }
             };
 
-            let interruption = match end {
+            let prefilled = continuing.is_some() && progress_before.0 > 0;
+            let no_progress =
+                progress_before == (delivered.text.len(), delivered.tool_request);
+            let next = match end {
+                // A prefilled request that adds nothing was not a continuation:
+                // the model saw a finished turn and had nothing to say.
+                AttemptEnd::Complete if prefilled && no_progress => {
+                    match continuing {
+                        Some(Continuing::AfterInterruption(error)) => {
+                            Err::<(), ProviderError>(error)?
+                        }
+                        _ => {
+                            let marker = output_limit_marker(delivered.anchor_id.clone());
+                            yield (Some(marker), None);
+                        }
+                    }
+                    break;
+                }
                 AttemptEnd::Complete => break,
                 AttemptEnd::OutputLimit => {
                     output_limit_continuations += 1;
@@ -381,7 +394,7 @@ pub async fn stream(
                         max_attempts: max_resumes,
                     });
                     max_tokens = raise_output_budget(max_tokens, &policy);
-                    None
+                    Continuing::AfterOutputLimit
                 }
                 AttemptEnd::Interrupted(error) => {
                     let resumable = should_retry(&error, &retry_config)
@@ -406,14 +419,17 @@ pub async fn stream(
                     if !skip_backoff() {
                         sleep(backoff_delay(&error, &retry_config, interruptions)).await;
                     }
-                    Some(error)
+                    Continuing::AfterInterruption(error)
                 }
             };
 
-            let continuation = request
-                .continuation(max_tokens, &delivered, &policy, &mut accepted_params)
-                .await;
-            stream = match continuation {
+            // A caller that has seen nothing yet would take a later failure for
+            // a response that never started and ask for the whole thing again.
+            if !delivered.yielded {
+                delivered.yielded = true;
+                yield (None, None);
+            }
+            stream = match request.continuation(max_tokens, &delivered, &policy).await {
                 Ok(stream) => stream,
                 Err(continuation_error) => {
                     tracing::warn!(
@@ -422,9 +438,11 @@ pub async fn stream(
                     );
                     // The interruption is what the user needs to hear about; a
                     // response that merely ran out of tokens still stands.
-                    match interruption {
-                        Some(error) => Err::<(), ProviderError>(error)?,
-                        None => {
+                    match next {
+                        Continuing::AfterInterruption(error) => {
+                            Err::<(), ProviderError>(error)?
+                        }
+                        Continuing::AfterOutputLimit => {
                             let marker = output_limit_marker(delivered.anchor_id.clone());
                             yield (Some(marker), None);
                         }
@@ -432,7 +450,7 @@ pub async fn stream(
                     break;
                 }
             };
-            resumed = true;
+            continuing = Some(next);
         }
     }))
 }
@@ -528,10 +546,10 @@ mod tests {
     fn prefill_policy() -> StreamResumePolicy {
         StreamResumePolicy {
             prefill: true,
-            prefill_request_params: vec![HashMap::from([(
+            prefill_request_params: HashMap::from([(
                 "add_generation_prompt".to_string(),
                 json!(false),
-            )])],
+            )]),
             requires_finish_reason: true,
             default_max_tokens: Some(4096),
         }
@@ -868,42 +886,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_prefill_parameters_fall_back_to_the_next_set() {
-        let mut policy = prefill_policy();
-        policy.prefill_request_params.insert(
-            0,
-            HashMap::from([("continue_final_message".to_string(), json!(true))]),
-        );
+    async fn prefilled_request_that_adds_nothing_reports_the_interruption() {
         let provider = ScriptedProvider::new(
-            policy,
+            prefill_policy(),
             vec![
-                Ok(vec![text("first", "One, "), Err(connection_reset())]),
-                Err(ProviderError::RequestFailed(
-                    "Bad request (400)".to_string(),
-                )),
-                Ok(vec![text("second", "two, "), Err(connection_reset())]),
-                Ok(vec![text("third", "three."), finished("stop")]),
+                Ok(vec![text("first", "Hello, "), Err(connection_reset())]),
+                Ok(vec![finished("stop")]),
             ],
         );
 
         let outcome = run(&provider).await;
 
-        assert_eq!(outcome.error, None);
-        assert_eq!(outcome.text(), "One, two, three.");
-        let calls = provider.calls.lock().unwrap();
-        let sent = |call: usize, param: &str| {
-            calls[call]
-                .request_params
-                .as_ref()
-                .is_some_and(|params| params.contains_key(param))
-        };
-        assert!(sent(1, "continue_final_message"));
-        assert!(!sent(2, "continue_final_message"));
-        assert!(sent(2, "add_generation_prompt"));
-        assert!(
-            !sent(3, "continue_final_message"),
-            "the rejected parameters are not offered again"
+        assert_eq!(outcome.error, Some(connection_reset()));
+        assert_eq!(outcome.text(), "Hello, ");
+    }
+
+    #[tokio::test]
+    async fn cut_off_tool_call_with_nothing_delivered_is_not_mistaken_for_an_unstarted_response() {
+        let cut_off = || Ok(vec![truncated_tool_call("chunk", false)]);
+        let provider = ScriptedProvider::new(
+            prefill_policy(),
+            vec![cut_off(), cut_off(), cut_off(), cut_off()],
         );
+
+        let stream = stream(
+            provider.clone(),
+            &ModelConfig::new("model"),
+            "system",
+            &[Message::user().with_text("hello")],
+            &[],
+        )
+        .await
+        .unwrap();
+        let items: Vec<_> = stream.collect().await;
+
+        assert!(
+            matches!(items.first(), Some(Ok((None, None)))),
+            "the caller retries a stream whose first item is an error: {items:?}"
+        );
+        assert!(matches!(
+            items.last(),
+            Some(Err(ProviderError::NetworkError(_)))
+        ));
+        assert_eq!(provider.call_count(), 1 + DEFAULT_MAX_STREAM_RESUMES);
     }
 
     #[tokio::test]
@@ -959,6 +984,46 @@ mod tests {
             .map(|call| call.max_tokens)
             .collect();
         assert_eq!(budgets, vec![None, Some(8192), Some(16_384), Some(32_768)]);
+    }
+
+    #[tokio::test]
+    async fn output_limit_without_text_is_only_asked_again_with_a_larger_budget() {
+        let mut policy = prefill_policy();
+        policy.default_max_tokens = None;
+        let provider = ScriptedProvider::new(
+            policy,
+            vec![Ok(vec![
+                thinking("first", "Considering"),
+                limit_marker("first"),
+                finished("length"),
+            ])],
+        );
+
+        let outcome = run(&provider).await;
+
+        assert!(outcome.output_limit_reached());
+        assert_eq!(provider.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn prefilled_request_that_adds_nothing_still_reports_the_output_limit() {
+        let provider = ScriptedProvider::new(
+            prefill_policy(),
+            vec![
+                Ok(vec![
+                    text("first", "Part one, "),
+                    limit_marker("first"),
+                    finished("length"),
+                ]),
+                Ok(vec![finished("stop")]),
+            ],
+        );
+
+        let outcome = run(&provider).await;
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.text(), "Part one, ");
+        assert!(outcome.output_limit_reached());
     }
 
     #[tokio::test]

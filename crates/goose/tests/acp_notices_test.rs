@@ -118,9 +118,7 @@ fn output_limit_before_any_content() -> ResponseTemplate {
 }
 
 fn rate_limited() -> ResponseTemplate {
-    ResponseTemplate::new(429)
-        .insert_header("retry-after", "0")
-        .set_body_json(json!({"error": {"message": "slow down"}}))
+    ResponseTemplate::new(429).set_body_json(json!({"error": {"message": "slow down"}}))
 }
 
 fn bad_request() -> ResponseTemplate {
