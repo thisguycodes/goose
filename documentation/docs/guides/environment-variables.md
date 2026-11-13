@@ -95,12 +95,14 @@ Configurable retry parameters for LLM providers.
 
 A request that fails with a rate limit (HTTP 429), an overloaded or server error (5xx, including 529), or a network error is retried with exponential backoff. When the response says how long to wait (`Retry-After`, `retry-after-ms`, or the `x-ratelimit-reset-*` time of an exhausted limit), goose waits that long instead. Each retry is shown as a notification rather than added to the conversation.
 
-A response that stops part-way can be continued instead of failing the turn. goose sends the text received so far back as a trailing assistant message (a prefill) and the answer picks up where it left off. A response that reaches the model's output-token limit is continued the same way, with a larger output budget. This is on for Baseten endpoints and can be turned on for other providers that continue a trailing assistant message.
+A rate-limit or overload response gets more attempts than other errors, unless the provider asks to wait more than a minute or reports an exhausted quota. A server error that asks for a wait of more than a minute is not waited out.
+
+A response that stops part-way can be continued instead of failing the turn. goose sends the text received so far back as a trailing assistant message (a prefill) and the answer picks up where it left off. A response that reaches the model's output-token limit is continued the same way, with a larger output budget. This is on for Baseten Model APIs and can be turned on for other servers that continue a trailing assistant message.
 
 | Variable | Purpose | Default |
 |---------------------|-------------|---------|
-| `GOOSE_PROVIDER_RATE_LIMIT_MAX_RETRIES` | The max number of retry attempts for rate-limit and overload responses. Other errors keep the provider's own limit | 6 |
-| `GOOSE_PROVIDER_STREAM_RESUME` | `off` never sends a request again once its response has started. `prefill` continues an interrupted response from a prefill on any provider | Prefill for Baseten only |
+| `GOOSE_PROVIDER_RATE_LIMIT_MAX_RETRIES` | The max number of retry attempts for rate-limit and overload responses | 6 for providers that use the default of 3 retries, otherwise the provider's own limit |
+| `GOOSE_PROVIDER_STREAM_RESUME` | `off` never sends a request again once its response has started. `prefill` continues an interrupted response from a prefill on any provider | Prefill for Baseten Model APIs only |
 | `GOOSE_PROVIDER_MAX_STREAM_RESUMES` | How many times one response is resumed after an interruption, and how many times it is continued after reaching the output-token limit | 3 |
 | `GOOSE_PROVIDER_STREAM_RESUME_PARAMS` | A JSON object of request parameters sent with a prefilled request, replacing the provider's own | Provider-specific |
 | `GOOSE_PROVIDER_SKIP_BACKOFF` | Set to `true` to retry immediately instead of waiting | false |

@@ -19,6 +19,10 @@ pub const DEFAULT_MAX_RETRY_INTERVAL_MS: u64 = 30_000;
 pub const DEFAULT_RATE_LIMIT_MAX_RETRIES: usize = 6;
 pub const RATE_LIMIT_MAX_RETRIES_ENV: &str = "GOOSE_PROVIDER_RATE_LIMIT_MAX_RETRIES";
 
+/// A provider that asks for a longer wait than this is retried no more often
+/// than any other error, so the extra rate-limit attempts cannot add up to hours.
+const MAX_PATIENT_RETRY_DELAY: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts
@@ -119,23 +123,35 @@ pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
     }
 }
 
-/// Rate limits clear on the provider's schedule rather than ours, so they get
-/// more attempts than other transient failures. A config that disables retries
-/// stays disabled.
+/// How many times `error` is retried. Rate limits clear on the provider's
+/// schedule rather than ours, so they get more attempts than other transient
+/// failures unless the provider set its own limit, asked for a long wait, or
+/// reports a quota that waiting will not refill.
 pub fn max_retries_for(error: &ProviderError, config: &RetryConfig) -> usize {
-    match error {
-        ProviderError::RateLimitExceeded { .. } if config.max_retries > 0 => {
-            config.max_retries.max(rate_limit_max_retries())
-        }
-        _ => config.max_retries,
+    let ProviderError::RateLimitExceeded {
+        details,
+        retry_delay,
+    } = error
+    else {
+        return config.max_retries;
+    };
+    let details = details.to_lowercase();
+    if config.max_retries == 0
+        || retry_delay.is_some_and(|delay| delay > MAX_PATIENT_RETRY_DELAY)
+        || details.contains("quota")
+        || details.contains("billing")
+    {
+        return config.max_retries;
     }
-}
 
-fn rate_limit_max_retries() -> usize {
-    std::env::var(RATE_LIMIT_MAX_RETRIES_ENV)
+    let configured = std::env::var(RATE_LIMIT_MAX_RETRIES_ENV)
         .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(DEFAULT_RATE_LIMIT_MAX_RETRIES)
+        .and_then(|value| value.trim().parse().ok());
+    match configured {
+        Some(max_retries) => max_retries,
+        None if config.max_retries == DEFAULT_MAX_RETRIES => DEFAULT_RATE_LIMIT_MAX_RETRIES,
+        None => config.max_retries,
+    }
 }
 
 pub async fn retry_operation<F, Fut, T>(
@@ -153,13 +169,16 @@ where
         match operation().await {
             Ok(result) => return Ok(result),
             Err(error) => {
-                let max_retries = max_retries_for(&error, config);
-                if should_retry(&error, config) && attempts < max_retries {
+                let config = &RetryConfig {
+                    max_retries: max_retries_for(&error, config),
+                    ..config.clone()
+                };
+                if should_retry(&error, config) && attempts < config.max_retries {
                     attempts += 1;
                     tracing::warn!(
                         "Request failed, retrying ({}/{}): {:?}",
                         attempts,
-                        max_retries,
+                        config.max_retries,
                         error
                     );
 
@@ -174,7 +193,7 @@ where
                     retry_notice::notify(RetryNotice::Retrying {
                         error,
                         attempt: attempts,
-                        max_attempts: max_retries,
+                        max_attempts: config.max_retries,
                         delay,
                     });
                     sleep(delay).await;
@@ -240,6 +259,10 @@ impl<P: Provider> ProviderRetry for P {
             return match operation().await {
                 Ok(result) => Ok(result),
                 Err(error) => {
+                    let config = RetryConfig {
+                        max_retries: max_retries_for(&error, &config),
+                        ..config.clone()
+                    };
                     // Auth retry is separate from transient-error retries: we get
                     // at most 1 credential refresh, independent of max_retries.
                     if matches!(error, ProviderError::Authentication(_)) && !auth_retried {
@@ -261,13 +284,12 @@ impl<P: Provider> ProviderRetry for P {
                         }
                     }
 
-                    let max_retries = max_retries_for(&error, &config);
-                    if should_retry(&error, &config) && attempts < max_retries {
+                    if should_retry(&error, &config) && attempts < config.max_retries {
                         attempts += 1;
                         tracing::warn!(
                             "Request failed, retrying ({}/{}): {:?}",
                             attempts,
-                            max_retries,
+                            config.max_retries,
                             error
                         );
 
@@ -287,7 +309,7 @@ impl<P: Provider> ProviderRetry for P {
                         retry_notice::notify(RetryNotice::Retrying {
                             error,
                             attempt: attempts,
-                            max_attempts: max_retries,
+                            max_attempts: config.max_retries,
                             delay: if skip_backoff { Duration::ZERO } else { delay },
                         });
                         if skip_backoff {
